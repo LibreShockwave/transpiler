@@ -1,0 +1,4 @@
+[submodule "external/LibreShockwave"]
+	path = external/LibreShockwave
+	url = https://github.com/Quackster/LibreShockwave
+	branch = master

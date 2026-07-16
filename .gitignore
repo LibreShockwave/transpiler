@@ -1,3 +1,6 @@
-
 /runtime-template/node_modules
 /export-template/node_modules
+
+# CMake build output
+/build
+/cmake-build-*
