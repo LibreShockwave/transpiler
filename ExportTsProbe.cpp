@@ -17,6 +17,7 @@
 //   libreshockwave_export_ts <movie> [--out <dir>] [--frames <N>] [--no-preload-casts]
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
@@ -54,6 +55,7 @@
 #include "libreshockwave/player/score/ScoreBehaviorRef.hpp"
 #include "libreshockwave/player/score/ScoreNavigator.hpp"
 #include "libreshockwave/player/score/SpriteSpan.hpp"
+#include "libreshockwave/util/FileUtil.hpp"
 
 namespace fs = std::filesystem;
 namespace ls = libreshockwave;
@@ -82,6 +84,28 @@ std::vector<std::uint8_t> readFile(const fs::path& path) {
         }
     }
     return data;
+}
+
+void logMemoryUsage(const std::string& label) {
+    std::ifstream status("/proc/self/status");
+    if (!status) {
+        return;
+    }
+    std::string line;
+    while (std::getline(status, line)) {
+        if (line.rfind("VmRSS:", 0) == 0) {
+            std::cerr << "export_ts: memory [" << label << "] " << line.substr(line.find_first_not_of(" \t", 6)) << "\n";
+            break;
+        }
+    }
+}
+
+std::string lowerCopy(std::string_view value) {
+    std::string lowered(value);
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return lowered;
 }
 
 bool hasDirectorContainerHeader(const std::vector<std::uint8_t>& data) {
@@ -298,7 +322,7 @@ std::string scriptTypeToString(ls::chunks::ScriptChunkType t) {
 // Used only to tag emitted handlers with their dispatch event — it changes no behavior.
 bool isLingoSystemEvent(std::string_view name) {
     static const std::unordered_set<std::string_view> events = {
-        "prepareFrame", "enterFrame", "exitFrame", "beginSprite", "endSprite", "stepFrame",
+        "prepareMovie", "prepareFrame", "enterFrame", "exitFrame", "beginSprite", "endSprite", "stepFrame",
         "mouseDown", "mouseUp", "mouseEnter", "mouseLeave", "mouseWithin", "mouseUpOutside",
         "rightMouseDown", "rightMouseUp", "keyDown", "keyUp", "idle", "startMovie", "stopMovie",
         "stepMovie", "new", "openWindow", "closeWindow", "moveWindow", "resizeWindow",
@@ -346,16 +370,153 @@ std::string sanitizeTsIdentifier(std::string_view s) {
         "var", "let", "const", "function", "return", "if", "else", "while", "for", "break",
         "continue", "switch", "case", "default", "new", "this", "undefined", "true", "false",
         "null", "void", "typeof", "in", "of", "do", "try", "catch", "finally", "throw", "with",
+        "delete", "instanceof",
         "yield", "await", "async", "class", "extends", "super", "export", "import", "from", "as",
         "interface", "type", "namespace", "module", "declare", "abstract", "implements", "private",
         "protected", "public", "readonly", "static", "get", "set", "constructor", "debugger",
         "enum", "never", "unknown", "any", "object", "number", "string", "boolean", "symbol",
-        "bigint", "me",
+        "bigint", "me", "package", "arguments", "eval", "top",
     };
     if (reserved.count(out) > 0) {
         out = "_" + out;
     }
     return out;
+}
+
+// Determine the web-server root that serves the movie so local files such as
+// /gamedata/external_variables.txt can be resolved on disk. We walk up from the
+// movie directory until we pass a "dcr" segment; the directory above it is treated
+// as the web root (e.g. /var/www/html/dcr/r31_.../habbo.dcr -> /var/www/html).
+fs::path webRootForMovie(const fs::path& moviePath) {
+    fs::path dir = moviePath.parent_path();
+    while (!dir.empty() && dir.has_filename() && dir.filename() != "dcr") {
+        dir = dir.parent_path();
+    }
+    if (!dir.empty()) {
+        return dir.parent_path();
+    }
+    return moviePath.parent_path();
+}
+
+// Parse the local external_variables.txt and return cast.entry.* names in index order.
+std::vector<std::pair<int, std::string>> readExternalVariableCastEntries(const fs::path& moviePath) {
+    const fs::path root = webRootForMovie(moviePath);
+    const fs::path varPath = root / "gamedata" / "external_variables.txt";
+    std::vector<std::pair<int, std::string>> entries;
+    if (!fs::is_regular_file(varPath)) {
+        std::cerr << "export_ts: warning: external variables file not found: " << varPath.string() << "\n";
+        return entries;
+    }
+    std::ifstream in(varPath);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        constexpr std::string_view prefix = "cast.entry.";
+        if (line.rfind(prefix, 0) != 0) {
+            continue;
+        }
+        const auto eq = line.find('=', prefix.size());
+        if (eq == std::string::npos) {
+            continue;
+        }
+        const int idx = std::atoi(line.substr(prefix.size(), eq - prefix.size()).c_str());
+        if (idx <= 0) {
+            continue;
+        }
+        std::string name = line.substr(eq + 1);
+        name.erase(0, name.find_first_not_of(" \t\r\n"));
+        const auto endPos = name.find_last_not_of(" \t\r\n");
+        if (endPos != std::string::npos) {
+            name.erase(endPos + 1);
+        } else {
+            name.clear();
+        }
+        if (!name.empty()) {
+            entries.emplace_back(idx, name);
+        }
+    }
+    std::sort(entries.begin(), entries.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    return entries;
+}
+
+// Load the core external .cct files listed in external_variables.txt into the
+// empty dynamic cast slots. This makes their members and scripts available to
+// the exporter even though the movie file only ships empty placeholders.
+void loadCoreExternalCasts(ls::player::Player& player, const fs::path& moviePath) {
+    const auto entries = readExternalVariableCastEntries(moviePath);
+    if (entries.empty()) {
+        std::cerr << "export_ts: no cast.entry.* entries found; skipping core external cast load.\n";
+        return;
+    }
+
+    // Collect empty dynamic slot numbers, highest first, to match the Habbo
+    // runtime's getAvailableEmptyCast() behaviour (it pops from the end).
+    std::vector<int> emptySlots;
+    for (const auto& [num, castLib] : player.castLibManager().castLibs()) {
+        if (!castLib) {
+            continue;
+        }
+        const std::string name = lowerCopy(castLib->name());
+        if (name.find("empty") != std::string::npos) {
+            emptySlots.push_back(num);
+        }
+    }
+    std::sort(emptySlots.begin(), emptySlots.end(), std::greater<int>());
+    if (emptySlots.size() < entries.size()) {
+        std::cerr << "export_ts: warning: fewer empty slots (" << emptySlots.size()
+                  << ") than cast entries (" << entries.size() << ")\n";
+    }
+
+    const fs::path movieDir = moviePath.parent_path();
+    const std::size_t toLoad = std::min(entries.size(), emptySlots.size());
+    for (std::size_t i = 0; i < toLoad; ++i) {
+        const int slot = emptySlots[i];
+        const std::string& castName = entries[i].second;
+        fs::path chosen;
+        const fs::path cctCandidate = movieDir / (castName + ".cct");
+        if (fs::is_regular_file(cctCandidate)) {
+            chosen = cctCandidate;
+        } else {
+            const fs::path cstCandidate = movieDir / (castName + ".cst");
+            if (fs::is_regular_file(cstCandidate)) {
+                chosen = cstCandidate;
+            }
+        }
+        if (chosen.empty()) {
+            std::cerr << "export_ts: warning: external cast file not found for " << castName << "\n";
+            continue;
+        }
+        try {
+            const auto data = readFile(chosen);
+            if (data.empty()) {
+                continue;
+            }
+            if (!player.loadExternalCastFromCachedData(slot, data)) {
+                std::cerr << "export_ts: warning: failed to load external cast " << castName
+                          << " into slot " << slot << "\n";
+                continue;
+            }
+            if (auto castLib = player.castLibManager().getCastLib(slot)) {
+                if (!castLib->isLoaded()) {
+                    castLib->load();
+                }
+                castLib->setName(castName);
+                std::cerr << "export_ts: debug: loaded external cast " << castName
+                          << " into slot " << slot
+                          << " loaded=" << castLib->isLoaded()
+                          << " members=" << castLib->memberCount() << "\n";
+            } else {
+                std::cerr << "export_ts: debug: loaded external cast " << castName
+                          << " into slot " << slot << " (no castLib)\n";
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "export_ts: warning: exception loading external cast " << castName
+                      << ": " << e.what() << "\n";
+        }
+    }
 }
 
 // --- exporter ----------------------------------------------------------------
@@ -365,6 +526,7 @@ struct ExportOptions {
     fs::path outDir = "exported-movie";
     int frames = 0;        // 0 = all frames
     bool preloadCasts = true;
+    bool lingoInit = true; // --no-lingo-init: skip player.play() / prepareMovieFoundation()
     bool selfTestInks = false; // --self-test-inks: synthetic frames covering every InkMode
 };
 
@@ -375,11 +537,12 @@ ExportOptions parseOptions(int argc, char** argv) {
         const std::string_view arg(argv[index]);
         if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: " << argv[0]
-                      << " <movie> [--out <dir>] [--frames <N>] [--no-preload-casts]\n"
+                      << " <movie> [--out <dir>] [--frames <N>] [--no-preload-casts] [--no-lingo-init]\n"
                       << "       " << argv[0] << " --self-test-inks [--out <dir>]\n"
                       << "  --out <dir>          Output project directory (default: exported-movie)\n"
                       << "  --frames <N>         Export only the first N frames (default: all)\n"
                       << "  --no-preload-casts   Skip preloading external cast libraries\n"
+                      << "  --no-lingo-init      Skip player.play() / prepareMovieFoundation() (static export only)\n"
                       << "  --self-test-inks     Emit synthetic frames covering every InkMode (no movie)\n";
             std::exit(0);
         }
@@ -406,6 +569,10 @@ ExportOptions parseOptions(int argc, char** argv) {
         }
         if (arg == "--no-preload-casts") {
             options.preloadCasts = false;
+            continue;
+        }
+        if (arg == "--no-lingo-init") {
+            options.lingoInit = false;
             continue;
         }
         if (arg.starts_with('-')) {
@@ -510,6 +677,19 @@ BakedAsset bakeAndWriteAsset(const fs::path& outDir,
     if (!baked || baked->width() <= 0 || baked->height() <= 0) {
         return result;
     }
+    // Guard against runaway text/shape bakes. A single enormous bitmap (e.g. a text
+    // member used as a data buffer with a 200x285318 box) can exhaust process memory
+    // and make the export unusable. Members that exceed this cap are skipped during
+    // pre-bake; if they are genuinely rendered on a score sprite they will be baked
+    // per-frame using the sprite's actual dimensions in the main export loop.
+    constexpr std::size_t kMaxBakedPixels = 16 * 1024 * 1024;
+    const std::size_t pixelCount = static_cast<std::size_t>(baked->width()) * static_cast<std::size_t>(baked->height());
+    if (pixelCount > kMaxBakedPixels) {
+        std::cerr << "export_ts: warning: skipping oversized baked bitmap for " << stem
+                  << " (" << baked->width() << "x" << baked->height() << " = " << pixelCount
+                  << " pixels > " << kMaxBakedPixels << ")\n";
+        return result;
+    }
     const std::uint64_t hash = fnv1a64(baked->pixels());
     std::ostringstream keyStream;
     keyStream << "b" << std::hex << hash << std::dec
@@ -559,6 +739,18 @@ void preBakeCastMemberAssets(
             cm.castLib = castLibNum;
             cm.name = memberChunk->name();
             cm.type = std::string(::libreshockwave::cast::name(memberType));
+
+            // Text / Button / Shape members are not pre-baked. Their intrinsic
+            // dimensions can be enormous (text members used as data buffers with
+            // 200x285318 boxes), and the C++ frame pipeline bakes them per-frame
+            // with the sprite's actual dimensions when they appear on stage. We
+            // still record them in cast.json for name resolution and text content.
+            if (memberType == ::libreshockwave::cast::MemberType::Text
+                || memberType == ::libreshockwave::cast::MemberType::Button
+                || memberType == ::libreshockwave::cast::MemberType::Shape) {
+                castMembers.push_back(std::move(cm));
+                continue;
+            }
 
             if (memberType == ::libreshockwave::cast::MemberType::FilmLoop) {
                 // Film-loops: bake each internal sub-frame so the runtime can
@@ -643,6 +835,242 @@ struct ScriptRecord {
     int castLib = 0;        // cast library number the script member lives in
     int castMember = 0;     // cast member number within that library
     std::vector<ScriptHandlerRecord> handlers;
+};
+
+// Emit one LingoScriptChunk as a TS module under `outputDir / outputPrefix / <stem>.ts` and
+// return a populated `ScriptRecord` describing it. The `outputPrefix` is "src/scripts/" for
+// main-movie scripts and "src/castlib_scripts/" for scripts pulled out of directory-walk
+// .cct files. `stemPrefix` is prepended to the stem before dedup (e.g. "hh_paalu_") so two
+// castlibs that both contain a script named "init" don't collide. `namesFallbackFile` is
+// the main-movie DirectorFile, used when the script's owning DirectorFile doesn't expose
+// a ScriptNamesChunk (older castlibs). `scriptCastLib` is the same CastLib the script
+// belongs to, used as a fallback for ScriptNamesChunk resolution.
+ScriptRecord emitScriptModule(
+    std::shared_ptr<ls::chunks::ScriptChunk> script,
+    ls::DirectorFile& owningFile,
+    ls::DirectorFile& namesFallbackFile,
+    const std::shared_ptr<ls::player::cast::CastLib>& scriptCastLib,
+    int castLibNum,
+    int castMemberNum,
+    const fs::path& outputDir,
+    const std::string& outputPrefix,
+    const std::string& stemPrefix,
+    std::unordered_set<std::string>& writtenFiles,
+    std::size_t scriptIndex) {
+    if (!script) {
+        throw std::runtime_error("emitScriptModule called with null script");
+    }
+    // Resolve the script name from the ownership map (passed in via rawName param),
+    // then from the script's own name field, then from the fallback DirectorFile.
+    std::string rawName = script->scriptName();
+    if (rawName.empty()) {
+        rawName = namesFallbackFile.getScriptName(script);
+    }
+    std::string stem = sanitizeAssetName(rawName);
+    if (stem.empty()) {
+        stem = "script_" + std::to_string(scriptIndex);
+    }
+    const std::string prefixedStem = stemPrefix + stem;
+
+    std::size_t totalInstructions = 0;
+    std::size_t maxHandlerInstructions = 0;
+    std::size_t literalStringBytes = 0;
+    for (const auto& h : script->handlers()) {
+        totalInstructions += h.instructions.size();
+        maxHandlerInstructions = std::max(maxHandlerInstructions, h.instructions.size());
+    }
+    for (const auto& lit : script->literals()) {
+        if (std::holds_alternative<std::string>(lit.value)) {
+            literalStringBytes += std::get<std::string>(lit.value).size();
+        }
+    }
+    std::cerr << "export_ts: script name=" << rawName
+              << " stem=" << prefixedStem
+              << " castLib=" << castLibNum
+              << " castMember=" << castMemberNum
+              << " handlers=" << script->handlers().size()
+              << " instructions=" << totalInstructions
+              << " maxHandler=" << maxHandlerInstructions
+              << " literalBytes=" << literalStringBytes
+              << "\n";
+
+    // Stem dedup: pick the first non-colliding form. Use the prefixed stem for the
+    // initial insert so two castlibs with the same script name don't collide.
+    std::string base = prefixedStem;
+    int suffix = 1;
+    std::string dedupStem = base;
+    while (!writtenFiles.insert(dedupStem + ".ts").second) {
+        dedupStem = base + "_" + std::to_string(++suffix);
+    }
+
+    // Resolve the script names chunk from the script's owning DirectorFile context first.
+    // External cast libraries are loaded as separate DirectorFile objects, so their scripts
+    // report script->file() as that external file; using the main movie DirectorFile here
+    // resolves the wrong LNAM section and leaves handler names as <unknown:N>.
+    std::shared_ptr<ls::chunks::ScriptNamesChunk> names;
+    if (script->file()) {
+        names = const_cast<ls::DirectorFile*>(script->file())->getScriptNamesForScript(script);
+    }
+    if (!names && scriptCastLib) {
+        names = scriptCastLib->scriptNames();
+    }
+    if (!names) {
+        names = owningFile.getScriptNamesForScript(script);
+    }
+    if (!names) {
+        names = namesFallbackFile.scriptNames();
+    }
+    const ls::chunks::ScriptNamesChunk* namesPtr = names.get();
+
+    // Decompile the whole script (all handlers) to a single readable Lingo listing.
+    std::string lingoSource;
+    try {
+        ls::lingo::decompiler::LingoDecompiler decompiler;
+        lingoSource = decompiler.decompile(*script, namesPtr);
+    } catch (const std::exception& dex) {
+        lingoSource = "-- decompile failed: " + std::string(dex.what()) + "\n";
+    }
+
+    // Build the handler table from the parsed handler metadata.
+    ScriptRecord rec;
+    rec.name = rawName.empty() ? dedupStem : rawName;
+    rec.type = scriptTypeToString(script->resolvedScriptType());
+    rec.file = outputPrefix + dedupStem + ".ts";
+    rec.castLib = castLibNum;
+    rec.castMember = castMemberNum;
+    for (const auto& handler : script->handlers()) {
+        ScriptHandlerRecord hr;
+        hr.name = script->resolveName(handler.nameId, namesPtr);
+        if (hr.name.empty()) {
+            hr.name = "handler_" + std::to_string(handler.nameId);
+        }
+        hr.event = isLingoSystemEvent(hr.name) ? hr.name : "";
+        for (std::size_t ai = 0; ai < handler.argNameIds.size(); ++ai) {
+            std::string argName = script->resolveName(handler.argNameIds[ai], namesPtr);
+            if (argName.empty()) {
+                argName = "arg" + std::to_string(ai);
+            }
+            hr.args.push_back(std::move(argName));
+        }
+        rec.handlers.push_back(std::move(hr));
+    }
+
+    // Emit the TS module.
+    std::ostringstream ts;
+    ts << "// @ts-nocheck\n";
+    ts << "// Auto-generated from the decompiled Lingo script \""
+       << jsonEscape(rec.name) << "\" (type: " << rec.type << ").\n";
+    ts << "//\n";
+    ts << "// Stage 7 emission. The decompiled Lingo source is preserved verbatim in "
+       << "`lingoSource` (produced by the LibreShockwave LingoDecompiler — the same code\n";
+    ts << "// the C++ player uses to disassemble scripts). The `handlerStubs` table delegates "
+       << "to transpiled TypeScript\n";
+    ts << "// functions below, which execute live in the browser via the LingoRuntimeHost. "
+       << "Unhandled AST nodes fall back to\n";
+    ts << "// throwing `LingoNotImplemented`. Re-export to regenerate; do not hand-edit.\n\n";
+    ts << "import {\n";
+    ts << "  LingoNotImplemented,\n";
+    ts << "  type LingoMe, type LingoValue,\n";
+    ts << "} from \"../runtime/lingo-runtime.js\";\n\n";
+    ts << "export const lsScriptName = \"" << jsonEscape(rec.name) << "\";\n";
+    ts << "export const lsScriptType = \"" << jsonEscape(rec.type) << "\";\n";
+    ts << "export const lsCastLib = " << rec.castLib << ";\n";
+    ts << "export const lsCastMember = " << rec.castMember << ";\n";
+    ts << "export const lsLingoSource = \"" << jsonEscape(lingoSource) << "\";\n\n";
+    ts << "export interface LsScriptHandler {\n";
+    ts << "  name: string;\n";
+    ts << "  args: string[];\n";
+    ts << "  event: string | null;\n";
+    ts << "}\n\n";
+    ts << "export const lsHandlers: LsScriptHandler[] = [\n";
+    for (std::size_t hi = 0; hi < rec.handlers.size(); ++hi) {
+        const auto& hr = rec.handlers[hi];
+        ts << "  { name: \"" << jsonEscape(hr.name) << "\", args: [";
+        for (std::size_t ai = 0; ai < hr.args.size(); ++ai) {
+            if (ai) ts << ", ";
+            ts << "\"" << jsonEscape(hr.args[ai]) << "\"";
+        }
+        ts << "], event: " << (hr.event.empty() ? "null" : ("\"" + jsonEscape(hr.event) + "\"")) << " }";
+        if (hi + 1 < rec.handlers.size()) ts << ",";
+        ts << "\n";
+    }
+    ts << "];\n\n";
+
+    // Emit transpiled handler bodies via LingoNode::toTypeScript(). Fall back to a
+    // throwing stub if translation fails for a particular handler.
+    for (const auto& handler : script->handlers()) {
+        const std::string handlerName = script->getHandlerName(handler, namesPtr);
+        if (handlerName.empty()) {
+            continue;
+        }
+        try {
+            ls::lingo::decompiler::LingoDecompiler tsDecompiler;
+            ts << tsDecompiler.emitTypeScriptHandler(handler, *script, namesPtr) << "\n";
+        } catch (const std::exception& tex) {
+            std::cerr << "export_ts: warning: handler \"" << jsonEscape(handlerName)
+                  << "\" transpilation failed: " << tex.what() << "\n";
+            ts << "/* TypeScript transpilation failed for handler \"" << jsonEscape(handlerName)
+               << "\": " << jsonEscape(tex.what()) << " */\n";
+        }
+    }
+
+    ts << "export const lsHandlerStubs: Record<string, (...args: unknown[]) => LingoValue | void> = {\n";
+    for (const auto& hr : rec.handlers) {
+        const std::string key = sanitizeTsKey(hr.name);
+        const std::string safeName = sanitizeTsIdentifier(hr.name);
+        const bool explicitMe = !hr.args.empty() &&
+            (hr.args[0] == "me" || hr.args[0] == "ME" || hr.args[0] == "Me");
+        const std::size_t tsParamCount = hr.args.size() + (explicitMe ? 0 : 1);
+        ts << "  \"" << jsonEscape(key) << "\": (...args: unknown[]) => {\n";
+        ts << "    try {\n";
+        ts << "      return " << safeName << "(";
+        for (std::size_t pi = 0; pi < tsParamCount; ++pi) {
+            if (pi > 0) ts << ", ";
+            if (pi == 0 && !explicitMe) {
+                ts << "args[0] as LingoMe";
+            } else {
+                ts << "args[" << pi << "]";
+            }
+        }
+        ts << ");\n";
+        ts << "    } catch (e) {\n";
+        ts << "      if (e instanceof LingoNotImplemented) throw e;\n";
+        ts << "      throw new LingoNotImplemented(\"Lingo handler '" << jsonEscape(hr.name)
+           << "' threw during TS execution: \" + String(e));\n";
+        ts << "    }\n";
+        ts << "  },\n";
+    }
+    ts << "};\n";
+
+    const fs::path scriptPath = outputDir / rec.file;
+    fs::create_directories(scriptPath.parent_path());
+    std::ofstream sf(scriptPath, std::ios::trunc);
+    if (!sf) {
+        throw std::runtime_error("Unable to write script module: " + rec.file);
+    }
+    sf << ts.str();
+    if (!sf) {
+        throw std::runtime_error("Unable to write complete script module: " + rec.file);
+    }
+    logMemoryUsage("script " + rec.file);
+    return rec;
+}
+
+// A Director cast library emitted as a TS module under src/castlibs/. Each `.cct` file in
+// the movie's source dir becomes one of these; the runtime pre-loads every entry at startup
+// (mirroring the per-script import loop in main.ts) and registers the members + scripts
+// into the host's castlibs registry. This is the castlib-level analogue of ScriptRecord —
+// same shape, but the per-script bodies are re-exported from the existing src/scripts/*.ts
+// modules rather than emitted in-line, to avoid duplicating the LingoNode::toTypeScript
+// emit work.
+struct CastlibRecord {
+    int number = 0;             // Director cast library number (assigned by the exporter)
+    std::string name;           // cast library display name (e.g. "fuse_client", "hh_human")
+    std::string fileName;       // original .cct filename (e.g. "fuse_client.cct")
+    std::string file;           // emitted TS file path ("src/castlibs/castlib_<n>_<safeName>.ts")
+    bool isExternal = true;     // true for .cct casts; false for the main movie's internal cast
+    int memberCount = 0;        // total members registered
+    int scriptCount = 0;        // number of script members referenced from this castlib
 };
 
 // Every Director InkMode value (Ids.hpp). The synthetic self-test renders a known baked
@@ -818,16 +1246,124 @@ int main(int argc, char** argv) {
         });
 
         if (options.preloadCasts) {
-            (void)player.preloadAllCasts();
+            // Load external casts selectively rather than calling preloadAllCasts().
+            // preloadAllCasts() eagerly fetches every external cast library, including the
+            // many "empty" placeholder casts in Habbo, which together consume enough memory
+            // to trip the OOM killer (~13.5 GB). We read only casts whose file name does not
+            // contain "empty" directly from disk, then load the remaining internal casts by
+            // preload mode.
+            auto lower = [](const std::string& s) { return lowerCopy(s); };
+            const fs::path movieDir = options.moviePath.parent_path();
+            for (const auto& [num, castLib] : player.castLibManager().castLibs()) {
+                if (!castLib || !castLib->isExternal() || castLib->isLoaded()) {
+                    continue;
+                }
+                const std::string fileName = fs::path(castLib->fileName()).filename().string();
+                if (fileName.empty()) {
+                    continue;
+                }
+                const std::string lowerName = lower(fileName);
+                if (lowerName.find("empty") != std::string::npos) {
+                    continue;
+                }
+                const fs::path directory = std::filesystem::is_regular_file(movieDir)
+                                               ? movieDir.parent_path()
+                                               : movieDir;
+                const std::string castFileName = ls::util::getFileName(castLib->fileName());
+                std::vector<std::uint8_t> castData;
+                bool foundFile = false;
+                fs::path triedPath;
+                // Cast library binding files are authored as .cst but shipped as .cct (or vice versa).
+                // Try the literal file name first, then the cross-extension sibling.
+                const std::array<std::string, 2> suffixes = {castFileName, ""};
+                for (const std::string& suffix : suffixes) {
+                    fs::path candidate;
+                    if (suffix.empty()) {
+                        const std::string base = ls::util::getFileNameWithoutExtension(castFileName);
+                        if (base.empty()) {
+                            continue;
+                        }
+                        const std::string lower = lowerCopy(castLib->fileName());
+                        if (lower.rfind(".cst") == lower.size() - 4) {
+                            candidate = directory / (base + ".cct");
+                        } else if (lower.rfind(".cct") == lower.size() - 4) {
+                            candidate = directory / (base + ".cst");
+                        } else {
+                            candidate = directory / (base + ".cct");
+                        }
+                    } else {
+                        candidate = directory / suffix;
+                    }
+                    triedPath = candidate;
+                    if (std::filesystem::is_regular_file(candidate)) {
+                        try {
+                            castData = readFile(candidate);
+                            foundFile = true;
+                            break;
+                        } catch (const std::exception& e) {
+                            std::cerr << "export_ts: warning: could not read external cast " << candidate.string()
+                                      << ": " << e.what() << "\n";
+                        }
+                    }
+                }
+                if (!foundFile || castData.empty()) {
+                    std::cerr << "export_ts: warning: external cast file not found for "
+                              << castLib->fileName() << "\n";
+                    continue;
+                }
+                if (!player.loadExternalCastFromCachedData(num, castData)) {
+                    std::cerr << "export_ts: warning: failed to load external cast data for "
+                              << castLib->fileName() << "\n";
+                } else {
+                    std::cerr << "export_ts: debug: loaded external cast " << num
+                              << " name=" << castLib->name()
+                              << " members=" << castLib->memberCount()
+                              << "\n";
+                }
+            }
             player.castLibManager().preloadCasts(2);
             player.castLibManager().preloadCasts(1);
+
+            // Load the core external .cct casts that Habbo imports at runtime into the
+            // empty placeholder slots, so their members/scripts are exported too.
+            loadCoreExternalCasts(player, options.moviePath);
+
+            // Explicitly load each newly-populated dynamic slot so member chunks are
+            // decoded and available to the script/pre-bake loops below.
+            for (const auto& [num, castLib] : player.castLibManager().castLibs()) {
+                if (castLib && castLib->isFetched() && !castLib->isLoaded()) {
+                    castLib->load();
+                }
+            }
         }
+
+        // Snapshot the loaded external cast libraries (num -> castLib) before
+        // player.play() runs, since play() can drop members from casts that are
+        // not part of the score. The castlib emission loop uses this snapshot so
+        // every `.cct` Habbo references has a corresponding TS module, even if
+        // play() later unloads it.
+        std::vector<std::pair<int, std::shared_ptr<ls::player::cast::CastLib>>> externalLibsSnapshot;
+        for (const auto& [num, castLib] : player.castLibManager().castLibs()) {
+            if (!castLib) continue;
+            if (!castLib->isExternal()) continue;
+            if (castLib->memberCount() == 0) continue;
+            externalLibsSnapshot.emplace_back(num, castLib);
+        }
+        std::sort(externalLibsSnapshot.begin(), externalLibsSnapshot.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+        std::cerr << "export_ts: snapshotted " << externalLibsSnapshot.size()
+                  << " external castlibs for TS emission\n";
 
         // For Lingo export (Stage 7) the behavior manager needs the movie foundation prepared
         // so external-cast behavior references resolve. play() loads casts and registers scripts;
         // it also dispatches prepareMovie/startMovie/enterFrame, which we allow because the static
         // reference frames are produced by frameRenderPipeline().renderFrame(frame) below.
-        player.play();
+        // For heavily script-driven movies (e.g. Habbo) player.play() runs Lingo initialization
+        // that can allocate large amounts of memory or hang; --no-lingo-init skips it and exports
+        // the static score + scripts for the TS runtime to execute instead.
+        if (options.lingoInit) {
+            player.play();
+        }
 
         std::cerr << "export_ts: cast libraries:\n";
         for (const auto& [num, castLib] : player.castLibManager().castLibs()) {
@@ -840,6 +1376,7 @@ int main(int argc, char** argv) {
                 std::cerr << "  castLib " << num << " = null\n";
             }
         }
+        logMemoryUsage("after cast load");
 
         const int frameCount = player.frameCount();
         if (frameCount <= 0) {
@@ -900,10 +1437,13 @@ int main(int argc, char** argv) {
         std::unordered_map<std::string, std::string> memberNameToBitmapAsset;
 
         // Pre-bake every renderable cast member. This gives the runtime assets for
-        // Lingo-driven member swaps and sub-frame filmloop animation.
+        // Lingo-driven member swaps and sub-frame filmloop animation. The per-member
+        // pixel cap inside bakeAndWriteAsset prevents runaway text/data-buffer members
+        // from exhausting memory.
         std::vector<CastMemberRecord> castMembers;
         preBakeCastMemberAssets(player, *directorFile, options.outDir, writtenBitmaps,
                                 memberNameToBitmapAsset, castMembers);
+        logMemoryUsage("after prebake");
 
         std::vector<FrameRecord> frameRecords;
         frameRecords.reserve(static_cast<std::size_t>(framesToExport));
@@ -1079,6 +1619,7 @@ int main(int argc, char** argv) {
 
             frameRecords.push_back(std::move(frameRec));
         }
+        logMemoryUsage("after frame render");
 
         // --- cast member registry enrichment --------------------------------
         // Pre-bake already created a record for every renderable member. Now add
@@ -1109,9 +1650,27 @@ int main(int argc, char** argv) {
                         if (memberChunk->isText()) {
                             auto& cm = castMembers[indexIt->second];
                             bool found = false;
-                            if (auto styled = directorFile->getXmedStyledTextForMember(memberChunk)) {
-                                cm.text = styled->text;
-                                found = true;
+                            // Text chunks for external-cast members live in the member's owning
+                            // DirectorFile, not the main movie file.
+                            const auto* memberFile = memberChunk->file();
+                            auto* memberFileMut = memberFile ? const_cast<ls::DirectorFile*>(memberFile) : nullptr;
+                            if (memberFileMut && memberFileMut != directorFile.get()) {
+                                if (auto styled = memberFileMut->getXmedStyledTextForMember(memberChunk)) {
+                                    cm.text = styled->text;
+                                    found = true;
+                                }
+                                if (!found) {
+                                    if (auto textChunk = memberFileMut->getTextForMember(memberChunk)) {
+                                        cm.text = textChunk->text();
+                                        found = true;
+                                    }
+                                }
+                            }
+                            if (!found) {
+                                if (auto styled = directorFile->getXmedStyledTextForMember(memberChunk)) {
+                                    cm.text = styled->text;
+                                    found = true;
+                                }
                             }
                             if (!found) {
                                 if (auto textChunk = directorFile->getTextForMember(memberChunk)) {
@@ -1141,9 +1700,25 @@ int main(int argc, char** argv) {
                     }
                     if (memberChunk->isText()) {
                         bool found = false;
-                        if (auto styled = directorFile->getXmedStyledTextForMember(memberChunk)) {
-                            cm.text = styled->text;
-                            found = true;
+                        const auto* memberFile = memberChunk->file();
+                        auto* memberFileMut = memberFile ? const_cast<ls::DirectorFile*>(memberFile) : nullptr;
+                        if (memberFileMut && memberFileMut != directorFile.get()) {
+                            if (auto styled = memberFileMut->getXmedStyledTextForMember(memberChunk)) {
+                                cm.text = styled->text;
+                                found = true;
+                            }
+                            if (!found) {
+                                if (auto textChunk = memberFileMut->getTextForMember(memberChunk)) {
+                                    cm.text = textChunk->text();
+                                    found = true;
+                                }
+                            }
+                        }
+                        if (!found) {
+                            if (auto styled = directorFile->getXmedStyledTextForMember(memberChunk)) {
+                                cm.text = styled->text;
+                                found = true;
+                            }
                         }
                         if (!found) {
                             if (auto textChunk = directorFile->getTextForMember(memberChunk)) {
@@ -1156,6 +1731,7 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        logMemoryUsage("after cast registry");
 
         // --- sound cast members ----------------------------------------------
         // Director sound playback is Lingo-driven (no score sound channel, no parsed cue
@@ -1216,6 +1792,7 @@ int main(int argc, char** argv) {
                 sounds.push_back(std::move(rec));
             }
         }
+        logMemoryUsage("after sounds");
 
         // --- Lingo scripts -> src/scripts/*.ts --------------------------------
         // Stage 7 emission. Each script cast member is decompiled via the same LingoDecompiler
@@ -1231,6 +1808,13 @@ int main(int argc, char** argv) {
         // is the genuinely hard tail and is not faked here.
         std::vector<ScriptRecord> scripts;
         fs::create_directories(options.outDir / "src" / "scripts");
+        // Maps built during script emission so the castlib emission loop can reference
+        // the existing src/scripts/<stem>.ts module for each script member without
+        // double-emitting the handler bodies. `memberNameToStem` is the primary key
+        // (Director script name -> sanitized stem); `memberStemToFile` maps the stem
+        // back to its emitted relative path.
+        std::unordered_map<std::string, std::string> memberNameToStem;
+        std::unordered_map<std::string, std::string> memberStemToFile;
         {
             std::unordered_set<std::string> writtenFiles;
             // Collect every script chunk from the ownership map (internal + every external cast)
@@ -1253,6 +1837,7 @@ int main(int argc, char** argv) {
 
             for (std::size_t si = 0; si < allScripts.size(); ++si) {
                 const auto& script = allScripts[si];
+                std::cerr << "export_ts: emitting script " << (si + 1) << "/" << allScripts.size() << "\n";
                 std::string rawName;
                 std::shared_ptr<ls::player::cast::CastLib> scriptCastLib;
                 if (const auto ownIt = scriptOwnership.find(script); ownIt != scriptOwnership.end()) {
@@ -1269,19 +1854,42 @@ int main(int argc, char** argv) {
                 if (stem.empty()) {
                     stem = "script_" + std::to_string(si);
                 }
-                std::string base = stem;
-                int suffix = 1;
-                while (!writtenFiles.insert(stem + ".ts").second) {
-                    stem = base + "_" + std::to_string(++suffix);
+                std::size_t totalInstructions = 0;
+                std::size_t maxHandlerInstructions = 0;
+                std::size_t literalStringBytes = 0;
+                for (const auto& h : script->handlers()) {
+                    totalInstructions += h.instructions.size();
+                    maxHandlerInstructions = std::max(maxHandlerInstructions, h.instructions.size());
                 }
+                for (const auto& lit : script->literals()) {
+                    if (std::holds_alternative<std::string>(lit.value)) {
+                        literalStringBytes += std::get<std::string>(lit.value).size();
+                    }
+                }
+                std::cerr << "export_ts: script name=" << rawName
+                          << " stem=" << stem
+                          << " handlers=" << script->handlers().size()
+                          << " instructions=" << totalInstructions
+                          << " maxHandler=" << maxHandlerInstructions
+                          << " literalBytes=" << literalStringBytes
+                          << "\n";
+                // (The per-script dedup + collision suffix is now done by emitScriptModule
+                // below; the inline dedup that used to live here was removed to avoid
+                // double-counting stems in writtenFiles.)
 
                 // Resolve the script names chunk from the script's owning DirectorFile context first.
-                // The per-script context (via getScriptNamesForScript) carries the correct LNAM
-                // section; the cast library's global names chunk can be a different, shorter table
-                // that leaves built-in event symbols unresolved.
-                std::shared_ptr<ls::chunks::ScriptNamesChunk> names = directorFile->getScriptNamesForScript(script);
+                // External cast libraries are loaded as separate DirectorFile objects, so their scripts
+                // report script->file() as that external file; using the main movie DirectorFile here
+                // resolves the wrong LNAM section and leaves handler names as <unknown:N>.
+                std::shared_ptr<ls::chunks::ScriptNamesChunk> names;
+                if (script->file()) {
+                    names = const_cast<ls::DirectorFile*>(script->file())->getScriptNamesForScript(script);
+                }
                 if (!names && scriptCastLib) {
                     names = scriptCastLib->scriptNames();
+                }
+                if (!names) {
+                    names = directorFile->getScriptNamesForScript(script);
                 }
                 if (!names) {
                     names = directorFile->scriptNames();
@@ -1299,10 +1907,12 @@ int main(int argc, char** argv) {
 
                 // Build the handler table from the parsed handler metadata (independent of the
                 // decompiler text, so the table is complete even if decompilation is partial).
+                // rec.file is set later from emitScriptModule's emitted.file (which has the
+                // collision suffix applied).
                 ScriptRecord rec;
                 rec.name = rawName.empty() ? stem : rawName;
                 rec.type = scriptTypeToString(script->resolvedScriptType());
-                rec.file = "src/scripts/" + stem + ".ts";
+                // rec.file assigned below from emitScriptModule's return.
                 if (const auto it = scriptToCastMember.find(script); it != scriptToCastMember.end()) {
                     rec.castLib = it->second.first;
                     rec.castMember = it->second.second;
@@ -1320,7 +1930,9 @@ int main(int argc, char** argv) {
                 }
                 for (const auto& handler : script->handlers()) {
                     ScriptHandlerRecord hr;
-                    hr.name = script->getHandlerName(handler, namesPtr);
+                    // Use the same name resolution rule as the decompiler/transpiler so that the
+                    // handler table keys match the emitted TypeScript function names exactly.
+                    hr.name = script->resolveName(handler.nameId, namesPtr);
                     if (hr.name.empty()) {
                         hr.name = "handler_" + std::to_string(handler.nameId);
                     }
@@ -1334,114 +1946,512 @@ int main(int argc, char** argv) {
                     }
                     rec.handlers.push_back(std::move(hr));
                 }
+                // Emit the TS module for this script via the shared helper. Pass
+                // the castLib/castMember already resolved from scriptToCastMember +
+                // scriptOwnership (the helper does not see those maps). Pass
+                // `scriptCastLib` (from the ownership map) so the helper can fall
+                // back to its scriptNames() if the script's own DirectorFile doesn't
+                // expose a names chunk.
+                ScriptRecord emitted = emitScriptModule(
+                    script,
+                    *directorFile,
+                    *directorFile,
+                    scriptCastLib,
+                    rec.castLib,
+                    rec.castMember,
+                    options.outDir,
+                    "src/scripts/",
+                    /*stemPrefix=*/"",
+                    writtenFiles,
+                    si);
+                // Prefer the rich `rec` we built for the manifest (it has the
+                // scriptCastLib-resolved name and behavior channel), but use the
+                // helper's emitted file path so the castlib emission can find the
+                // script by the same stem the helper chose (post-collision-suffix).
+                rec.file = emitted.file;
                 scripts.push_back(rec);
-
-                // Emit the TS module.
-                std::ostringstream ts;
-                ts << "// @ts-nocheck\n";
-                ts << "// Auto-generated from the decompiled Lingo script \""
-                   << jsonEscape(rec.name) << "\" (type: " << rec.type << ").\n";
-                ts << "//\n";
-                ts << "// Stage 7 emission. The decompiled Lingo source is preserved verbatim in "
-                   << "`lingoSource` (produced by the LibreShockwave LingoDecompiler — the same code\n";
-                ts << "// the C++ player uses to disassemble scripts). The `handlerStubs` table delegates "
-                   << "to transpiled TypeScript\n";
-                ts << "// functions below, which execute live in the browser via the LingoRuntimeHost. "
-                   << "Unhandled AST nodes fall back to\n";
-                ts << "// throwing `LingoNotImplemented`. Re-export to regenerate; do not hand-edit.\n\n";
-                ts << "import {\n";
-                ts << "  LingoNotImplemented,\n";
-                ts << "  type LingoMe, type LingoValue,\n";
-                ts << "  integer, float, sprite, member, theProperty, setTheProperty, thePropOf, setThePropOf,\n";
-                ts << "  callBuiltin, symbol, _symbol, LingoList, LingoPropList,\n";
-                ts << "  globalVar, setGlobal, varRef, callMethod, newObj, _new, _return,\n";
-                ts << "  spriteIntersects, spriteWithin, menuProp, menuItemProp, soundProp, chunkOf,\n";
-                ts << "  deleteChunk, contains, starts, createMe, meProp, setMeProp, sendSprite, put,\n";
-                ts << "  voidp, listp, stringp, count, getAt, setAt, getProp, getaProp, addProp, deleteProp,\n";
-                ts << "  add, getPropAt, chunkCount, lastChunk, charToNum, numToChar,\n";
-                ts << "  duplicate, sort, paletteIndex, abs, sqrt, atan, setProp,\n";
-                ts << "} from \"../runtime/lingo-runtime.js\";\n\n";
-                ts << "export const scriptName = \"" << jsonEscape(rec.name) << "\";\n";
-                ts << "export const scriptType = \"" << jsonEscape(rec.type) << "\";\n";
-                ts << "export const castLib = " << rec.castLib << ";\n";
-                ts << "export const castMember = " << rec.castMember << ";\n";
-                ts << "export const lingoSource = \"" << jsonEscape(lingoSource) << "\";\n\n";
-                ts << "export interface ScriptHandler {\n";
-                ts << "  name: string;\n";
-                ts << "  args: string[];\n";
-                ts << "  event: string | null;\n";
-                ts << "}\n\n";
-                ts << "export const handlers: ScriptHandler[] = [\n";
-                for (std::size_t hi = 0; hi < rec.handlers.size(); ++hi) {
-                    const auto& hr = rec.handlers[hi];
-                    ts << "  { name: \"" << jsonEscape(hr.name) << "\", args: [";
-                    for (std::size_t ai = 0; ai < hr.args.size(); ++ai) {
-                        if (ai) ts << ", ";
-                        ts << "\"" << jsonEscape(hr.args[ai]) << "\"";
-                    }
-                    ts << "], event: " << (hr.event.empty() ? "null" : ("\"" + jsonEscape(hr.event) + "\"")) << " }";
-                    if (hi + 1 < rec.handlers.size()) ts << ",";
-                    ts << "\n";
-                }
-                ts << "];\n\n";
-
-                // Emit transpiled handler bodies via LingoNode::toTypeScript(). Fall back to a
-                // throwing stub if translation fails for a particular handler.
-                for (const auto& handler : script->handlers()) {
-                    const std::string handlerName = script->getHandlerName(handler, namesPtr);
-                    if (handlerName.empty()) {
-                        continue;
-                    }
-                    try {
-                        ls::lingo::decompiler::LingoDecompiler tsDecompiler;
-                        const std::string tsBody = tsDecompiler.emitTypeScriptHandler(handler, *script, namesPtr);
-                        ts << tsBody << "\n";
-                    } catch (const std::exception& tex) {
-                        ts << "/* TypeScript transpilation failed for handler \"" << jsonEscape(handlerName)
-                           << "\": " << jsonEscape(tex.what()) << " */\n";
-                    }
-                }
-
-                ts << "export const handlerStubs: Record<string, (...args: unknown[]) => LingoValue | void> = {\n";
-                for (const auto& hr : rec.handlers) {
-                    const std::string key = sanitizeTsKey(hr.name);
-                    const std::string safeName = sanitizeTsIdentifier(hr.name);
-                    const bool explicitMe = !hr.args.empty() &&
-                        (hr.args[0] == "me" || hr.args[0] == "ME" || hr.args[0] == "Me");
-                    const std::size_t tsParamCount = hr.args.size() + (explicitMe ? 0 : 1);
-                    ts << "  \"" << jsonEscape(key) << "\": (...args: unknown[]) => {\n";
-                    ts << "    try {\n";
-                    ts << "      return " << safeName << "(";
-                    for (std::size_t pi = 0; pi < tsParamCount; ++pi) {
-                        if (pi > 0) ts << ", ";
-                        if (pi == 0 && !explicitMe) {
-                            ts << "args[0] as LingoMe";
-                        } else {
-                            ts << "args[" << pi << "]";
+                // Record the script's stem so the castlib emission can reference it.
+                // The stem is the unique suffix that resolves collisions (see the
+                // writtenFiles dedup above), so we extract it from rec.file.
+                const std::string stemFromFile = [&rec]() {
+                    const std::string prefix = "src/scripts/";
+                    if (rec.file.size() > prefix.size() && rec.file.compare(0, prefix.size(), prefix) == 0) {
+                        std::string name = rec.file.substr(prefix.size());
+                        if (name.size() > 3 && name.compare(name.size() - 3, 3, ".ts") == 0) {
+                            return name.substr(0, name.size() - 3);
                         }
                     }
-                    ts << ");\n";
-                    ts << "    } catch (e) {\n";
-                    ts << "      if (e instanceof LingoNotImplemented) throw e;\n";
-                    ts << "      throw new LingoNotImplemented(\"Lingo handler '" << jsonEscape(hr.name)
-                       << "' threw during TS execution: \" + String(e));\n";
-                    ts << "    }\n";
-                    ts << "  },\n";
-                }
-                ts << "};\n";
-
-                const fs::path scriptPath = options.outDir / rec.file;
-                fs::create_directories(scriptPath.parent_path());
-                std::ofstream sf(scriptPath, std::ios::trunc);
-                if (!sf) {
-                    throw std::runtime_error("Unable to write script module: " + rec.file);
-                }
-                sf << ts.str();
-                if (!sf) {
-                    throw std::runtime_error("Unable to write complete script module: " + rec.file);
+                    return std::string{};
+                }();
+                if (!stemFromFile.empty()) {
+                    if (!rec.name.empty()) {
+                        memberNameToStem[rec.name] = stemFromFile;
+                    }
+                    memberStemToFile[stemFromFile] = rec.file;
                 }
             }
         }
+        logMemoryUsage("after scripts");
+
+        // --- castlib emission: per-`.cct` TS modules ----------------------------
+        // Every external cast library the C++ player loaded (via `loadCoreExternalCasts`
+        // and the preloadCasts block above) becomes a TS module under src/castlibs/.
+        // The runtime's `main.ts` eagerly `import()`s every entry in
+        // `manifest.castlibs` at startup and calls `lingoHost.registerCastlib(...)`
+        // so subsequent `member("name", castLibNum)` lookups hit the same registry
+        // the castload manager's `setImportedCast` calls populate. Placeholder
+        // cast libraries (size < 1024 bytes) are skipped — they're empty
+        // placeholders Director uses to pre-allocate slot numbers.
+        std::vector<CastlibRecord> castlibs;
+        fs::create_directories(options.outDir / "src" / "castlibs");
+        {
+            std::unordered_set<std::string> writtenCastlibFiles;
+            // Use the snapshot taken before player.play() ran — by the time we get
+            // here, player.play() has cleared member counts on most external castlibs.
+            // The snapshot preserves them so every `.cct` Habbo references has a
+            // corresponding TS module.
+            const auto& externalLibs = externalLibsSnapshot;
+
+            for (const auto& [num, castLib] : externalLibs) {
+                // Resolve the actual `.cct` filename on disk. The castlib's
+                // `fileName()` field is the empty.cst placeholder (the C++ player
+                // doesn't update it when loadCoreExternalCasts loads a real .cct
+                // into the slot), so derive the fileName from the castlib name.
+                const std::string castNameForFile = castLib->name();
+                std::string fileName = castNameForFile + ".cct";
+                if (!fs::is_regular_file(options.moviePath.parent_path() / fileName)) {
+                    fileName = castNameForFile + ".cst";
+                    if (!fs::is_regular_file(options.moviePath.parent_path() / fileName)) {
+                        // Fall back to whatever the castlib reports.
+                        fileName = fs::path(castLib->fileName()).filename().string();
+                    }
+                }
+                if (fileName.empty()) continue;
+
+                // Resolve the parsed DirectorFile backing this castlib. The castlib's
+                // own `sourceFile()` is the per-cct DirectorFile; the main movie's
+                // `directorFile` is the one we pass as a fallback for getTextForMember.
+                std::shared_ptr<ls::DirectorFile> castlibDirectorFile = castLib->sourceFile();
+                if (!castlibDirectorFile) {
+                    // Fall back to the main movie DirectorFile (some castlibs inherit
+                    // the main file when they have no separate source binding).
+                    castlibDirectorFile = directorFile;
+                }
+
+                // Sanitize the name for the filename; collisions get a numeric suffix.
+                std::string safeName = sanitizeAssetName(castLib->name());
+                if (safeName.empty()) {
+                    safeName = sanitizeAssetName(fs::path(fileName).stem().string());
+                }
+                if (safeName.empty()) {
+                    safeName = "castlib_" + std::to_string(num);
+                }
+                std::string stem = "castlib_" + std::to_string(num)
+                    + (safeName.find_first_not_of("0123456789_") == std::string::npos ? "" : "_" + safeName);
+                std::string rel = "src/castlibs/" + stem + ".ts";
+                int suffix = 1;
+                std::string base = stem;
+                while (!writtenCastlibFiles.insert(stem + ".ts").second) {
+                    stem = base + "_" + std::to_string(++suffix);
+                    rel = "src/castlibs/" + stem + ".ts";
+                }
+
+                CastlibRecord rec;
+                rec.number = num;
+                rec.name = castLib->name();
+                rec.fileName = fileName;
+                rec.file = rel;
+                rec.isExternal = true;
+                rec.memberCount = 0;
+                rec.scriptCount = 0;
+
+                // Build the TS module.
+                std::ostringstream ts;
+                ts << "// @ts-nocheck\n";
+                ts << "// Auto-generated cast library module for " << jsonEscape(fileName) << ".\n";
+                ts << "//\n";
+                ts << "// One TS module per `.cct` file the C++ exporter emitted. The runtime eagerly\n";
+                ts << "// `import()`s every entry in manifest.castlibs at startup (see main.ts) and\n";
+                ts << "// calls `lingoHost.registerCastlib(...)` so subsequent `member(name, castLibNum)`\n";
+                ts << "// lookups hit the same registry the castload manager's `setImportedCast` calls\n";
+                ts << "// populate. Do not hand-edit; re-export to regenerate.\n\n";
+                ts << "export const lsCastLib = " << num << ";\n";
+                ts << "export const lsCastLibName = \"" << jsonEscape(castLib->name()) << "\";\n\n";
+                ts << "export interface LsCastlibMember {\n";
+                ts << "  id: number;\n";
+                ts << "  name: string;\n";
+                ts << "  type: string;\n";
+                ts << "  text?: string;\n";
+                ts << "  bakedBitmapAsset?: string;\n";
+                ts << "  bakedWidth?: number;\n";
+                ts << "  bakedHeight?: number;\n";
+                ts << "}\n\n";
+                ts << "export const lsMembers: LsCastlibMember[] = [\n";
+
+                std::size_t memberIdx = 0;
+                for (const auto& [memberNumber, memberChunk] : castLib->memberChunks()) {
+                    if (!memberChunk) continue;
+                    const auto memberType = memberChunk->memberType();
+                    const std::string_view typeNameView = ::libreshockwave::cast::name(memberType);
+                    const std::string typeName(typeNameView);
+                    const std::string memberName = memberChunk->name();
+                    ++rec.memberCount;
+
+                    // Text content for text/field members. Try the castlib's own
+                    // DirectorFile first, then fall back to the main movie's file.
+                    std::string memberText;
+                    if (memberChunk->isText()) {
+                        bool resolved = false;
+                        if (castlibDirectorFile && castlibDirectorFile.get() != directorFile.get()) {
+                            if (auto styled = castlibDirectorFile->getXmedStyledTextForMember(memberChunk)) {
+                                memberText = styled->text;
+                                resolved = true;
+                            }
+                            if (!resolved) {
+                                if (auto textChunk = castlibDirectorFile->getTextForMember(memberChunk)) {
+                                    memberText = textChunk->text();
+                                    resolved = true;
+                                }
+                            }
+                        }
+                        if (!resolved) {
+                            if (auto styled = directorFile->getXmedStyledTextForMember(memberChunk)) {
+                                memberText = styled->text;
+                                resolved = true;
+                            }
+                        }
+                        if (!resolved) {
+                            if (auto textChunk = directorFile->getTextForMember(memberChunk)) {
+                                memberText = textChunk->text();
+                            }
+                        }
+                    }
+
+                    // Baked bitmap dedup via the global memberNameToBitmapAsset map.
+                    std::string bakedAsset;
+                    int bakedW = 0, bakedH = 0;
+                    if (!memberName.empty()) {
+                        const auto it = memberNameToBitmapAsset.find(memberName);
+                        if (it != memberNameToBitmapAsset.end()) {
+                            bakedAsset = it->second;
+                            // Best-effort dimension parse from the asset path
+                            // (e.g. "assets/bitmaps/b<hash>_w32_h32.rgba").
+                            const auto wPos = bakedAsset.find("_w");
+                            const auto hPos = bakedAsset.find("_h");
+                            if (wPos != std::string::npos && hPos != std::string::npos) {
+                                bakedW = std::atoi(bakedAsset.c_str() + wPos + 2);
+                                bakedH = std::atoi(bakedAsset.c_str() + hPos + 2);
+                            }
+                        }
+                    }
+
+                    ts << "  { id: " << memberNumber
+                       << ", name: \"" << jsonEscape(memberName) << "\""
+                       << ", type: \"" << jsonEscape(typeName) << "\"";
+                    if (!memberText.empty()) {
+                        ts << ", text: \"" << jsonEscape(memberText) << "\"";
+                    }
+                    if (!bakedAsset.empty()) {
+                        ts << ", bakedBitmapAsset: \"" << jsonEscape(bakedAsset) << "\""
+                           << ", bakedWidth: " << bakedW
+                           << ", bakedHeight: " << bakedH;
+                    }
+                    ts << " }";
+                    if (++memberIdx < castLib->memberChunks().size()) ts << ",";
+                    ts << "\n";
+                }
+                ts << "];\n\n";
+                ts << "export const lsScripts: Array<{ name: string; castMember: number; file: string }> = [\n";
+
+                // For each script member, reference the existing per-script TS module.
+                for (const auto& [memberNumber, memberChunk] : castLib->memberChunks()) {
+                    if (!memberChunk || !memberChunk->isScript()) continue;
+                    ++rec.scriptCount;
+                    const std::string memberName = memberChunk->name();
+                    const auto stemIt = memberNameToStem.find(memberName);
+                    if (stemIt == memberNameToStem.end()) continue;
+                    const auto fileIt = memberStemToFile.find(stemIt->second);
+                    if (fileIt == memberStemToFile.end()) continue;
+                    ts << "  { name: \"" << jsonEscape(memberName) << "\""
+                       << ", castMember: " << memberNumber
+                       << ", file: \"" << jsonEscape(fileIt->second) << "\" },\n";
+                }
+                ts << "];\n";
+
+                const fs::path castlibPath = options.outDir / rel;
+                std::ofstream out(castlibPath, std::ios::trunc);
+                if (!out) {
+                    throw std::runtime_error("Unable to write castlib module: " + rel);
+                }
+                out << ts.str();
+                if (!out) {
+                    throw std::runtime_error("Unable to write complete castlib module: " + rel);
+                }
+                castlibs.push_back(std::move(rec));
+                logMemoryUsage("castlib " + rel);
+            }
+        }
+        logMemoryUsage("after castlibs (snapshot)");
+
+        // --- castlib emission: every `.cct` in the source dir -------------------
+        // The snapshot above only covers the .cct files loadCoreExternalCasts()
+        // loaded at startup. The Habbo source dir ships 220 real .cct files
+        // (plus the `empty.cct` placeholder), but only 49 are pre-loaded because
+        // there are 83 castlib slots total (slot 1 = Internal, slot 2 = fuse_client,
+        // slot 3 = bin, slots 4-35 = empty placeholders, slots 36-83 = the 48
+        // pre-loaded .cct files). The remaining 171 .cct files would only be
+        // fetched at runtime by the castload manager if the user navigated to
+        // features that needed them.
+        //
+        // To avoid the runtime needing to download those .cct files, we walk
+        // the source dir and emit a TS module for every real .cct. Casts already
+        // covered by the snapshot are skipped (the snapshot uses the real slot
+        // numbers from loadCoreExternalCasts, which is what the castload manager
+        // expects at runtime). Casts not in the snapshot get synthetic slot
+        // numbers starting at SYNTHETIC_CASTLIB_BASE (=200) so they don't
+        // collide with the C++ player's slot range.
+        //
+        // The runtime registers all of these in `lingoHost.castlibs`, keyed by
+        // slot number. The castload manager at runtime only allocates from
+        // slots 4-35 (the remaining empty placeholders), so the synthetic slots
+        // are never reached by `setImportedCast` — but `member("name", n)` name
+        // lookups walk every registered castlib via `resolveMember`, so the
+        // members are accessible regardless of which slot the Lingo code asks
+        // for. The synthetic slots exist solely so the host's per-castlib
+        // registry has a unique key for each .cct.
+        constexpr int SYNTHETIC_CASTLIB_BASE = 200;
+        std::unordered_set<std::string> coveredStems;
+        for (const auto& rec : castlibs) {
+            // The .cct filename's stem (e.g. "hh_pets" from "hh_pets.cct") is
+            // the stable identifier across snapshot + directory-walk passes.
+            const fs::path p(rec.fileName);
+            const std::string stem = p.stem().string();
+            if (!stem.empty()) coveredStems.insert(stem);
+        }
+
+        const fs::path movieDirForCastlibs = options.moviePath.parent_path();
+        std::vector<fs::path> cctFiles;
+        for (const auto& entry : fs::directory_iterator(movieDirForCastlibs)) {
+            if (!entry.is_regular_file()) continue;
+            const std::string ext = entry.path().extension().string();
+            if (ext != ".cct" && ext != ".cst") continue;
+            // Skip the empty placeholder; the C++ player never loads it as a
+            // real castlib.
+            const std::string fname = entry.path().filename().string();
+            if (fname == "empty.cct" || fname == "empty.cst") continue;
+            // Skip files we already covered via the snapshot (by stem so we
+            // match even if the snapshot castlib's `fileName` field is stale).
+            if (coveredStems.count(entry.path().stem().string())) continue;
+            cctFiles.push_back(entry.path());
+        }
+        std::sort(cctFiles.begin(), cctFiles.end());
+
+        std::cerr << "export_ts: directory walk found " << cctFiles.size()
+                  << " additional .cct files to emit\n";
+
+        int syntheticSlot = SYNTHETIC_CASTLIB_BASE;
+        for (const auto& cctPath : cctFiles) {
+            const std::string fileName = cctPath.filename().string();
+            const std::string stem = cctPath.stem().string();
+            const auto data = readFile(cctPath);
+            if (data.empty()) {
+                std::cerr << "export_ts: skipping empty .cct file " << fileName << "\n";
+                continue;
+            }
+            std::shared_ptr<ls::DirectorFile> cctDirectorFile;
+            try {
+                cctDirectorFile = ls::DirectorFile::load(data);
+            } catch (const std::exception& ex) {
+                std::cerr << "export_ts: failed to parse " << fileName << ": " << ex.what() << "\n";
+                continue;
+            }
+            if (!cctDirectorFile) {
+                std::cerr << "export_ts: failed to parse " << fileName << " (null DirectorFile)\n";
+                continue;
+            }
+
+            // Pull the castlib metadata: the first CastChunk in the .cct file is
+            // the cast library definition. CastChunk has no name field, so the
+            // cast library name is the .cct file's stem (e.g. "fuse_client.cct"
+            // -> "fuse_client"). This matches what the C++ player would do when
+            // loading the .cct into a slot.
+            const auto& casts = cctDirectorFile->casts();
+            if (casts.empty()) {
+                std::cerr << "export_ts: no CastChunk in " << fileName << "\n";
+                continue;
+            }
+            const std::string castName = stem;
+            const std::string castNameSafe = castName;
+            const int slot = syntheticSlot++;
+
+            // Build the file path.
+            std::string safeName = sanitizeAssetName(castNameSafe);
+            if (safeName.empty()) safeName = sanitizeAssetName(stem);
+            if (safeName.empty()) safeName = "castlib_" + std::to_string(slot);
+            const std::string rel = "src/castlibs/castlib_" + std::to_string(slot) + "_" + safeName + ".ts";
+
+            CastlibRecord rec;
+            rec.number = slot;
+            rec.name = castNameSafe;
+            rec.fileName = fileName;
+            rec.file = rel;
+            rec.isExternal = true;
+            rec.memberCount = 0;
+            rec.scriptCount = 0;
+
+            std::ostringstream ts;
+            ts << "// @ts-nocheck\n";
+            ts << "// Auto-generated cast library module for " << jsonEscape(fileName) << ".\n";
+            ts << "//\n";
+            ts << "// One TS module per `.cct` file the C++ exporter emitted. The runtime eagerly\n";
+            ts << "// `import()`s every entry in manifest.castlibs at startup (see main.ts) and\n";
+            ts << "// calls `lingoHost.registerCastlib(...)` so subsequent `member(name, castLibNum)`\n";
+            ts << "// lookups hit the same registry the castload manager's `setImportedCast` calls\n";
+            ts << "// populate. This .cct was not pre-loaded by loadCoreExternalCasts (it lives\n";
+            ts << "// outside the 49-entry cast.entry.* startup list) and so is registered with a\n";
+            ts << "// synthetic slot number; the runtime can still find its members by name.\n\n";
+            ts << "export const lsCastLib = " << slot << ";\n";
+            ts << "export const lsCastLibName = \"" << jsonEscape(castNameSafe) << "\";\n\n";
+            ts << "export interface LsCastlibMember {\n";
+            ts << "  id: number;\n";
+            ts << "  name: string;\n";
+            ts << "  type: string;\n";
+            ts << "  text?: string;\n";
+            ts << "  bakedBitmapAsset?: string;\n";
+            ts << "  bakedWidth?: number;\n";
+            ts << "  bakedHeight?: number;\n";
+            ts << "}\n\n";
+            ts << "export const lsMembers: LsCastlibMember[] = [\n";
+
+            // Walk every CastMemberChunk in the .cct and emit a JSON-shaped entry.
+            const auto& members = cctDirectorFile->castMembers();
+            for (std::size_t i = 0; i < members.size(); ++i) {
+                const auto& memberChunk = members[i];
+                if (!memberChunk) continue;
+                const auto memberType = memberChunk->memberType();
+                const std::string_view typeNameView = ::libreshockwave::cast::name(memberType);
+                const std::string typeName(typeNameView);
+                const int memberNumber = i + 1; // Director member numbers are 1-indexed
+                const std::string memberName = memberChunk->name();
+                ++rec.memberCount;
+
+                std::string memberText;
+                if (memberChunk->isText()) {
+                    if (auto styled = cctDirectorFile->getXmedStyledTextForMember(memberChunk)) {
+                        memberText = styled->text;
+                    } else if (auto textChunk = cctDirectorFile->getTextForMember(memberChunk)) {
+                        memberText = textChunk->text();
+                    }
+                }
+
+                std::string bakedAsset;
+                int bakedW = 0, bakedH = 0;
+                if (!memberName.empty()) {
+                    const auto it = memberNameToBitmapAsset.find(memberName);
+                    if (it != memberNameToBitmapAsset.end()) {
+                        bakedAsset = it->second;
+                        const auto wPos = bakedAsset.find("_w");
+                        const auto hPos = bakedAsset.find("_h");
+                        if (wPos != std::string::npos && hPos != std::string::npos) {
+                            bakedW = std::atoi(bakedAsset.c_str() + wPos + 2);
+                            bakedH = std::atoi(bakedAsset.c_str() + hPos + 2);
+                        }
+                    }
+                }
+
+                ts << "  { id: " << memberNumber
+                   << ", name: \"" << jsonEscape(memberName) << "\""
+                   << ", type: \"" << jsonEscape(typeName) << "\"";
+                if (!memberText.empty()) {
+                    ts << ", text: \"" << jsonEscape(memberText) << "\"";
+                }
+                if (!bakedAsset.empty()) {
+                    ts << ", bakedBitmapAsset: \"" << jsonEscape(bakedAsset) << "\""
+                       << ", bakedWidth: " << bakedW
+                       << ", bakedHeight: " << bakedH;
+                }
+                ts << " }";
+                if (i + 1 < members.size()) ts << ",";
+                ts << "\n";
+            }
+            ts << "];\n\n";
+            ts << "export const lsScripts: Array<{ name: string; castMember: number; file: string }> = [\n";
+
+            // Emit a per-script TS file under src/castlib_scripts/ for every script
+            // member in this castlib. The runtime's main.ts loads them at startup
+            // (via the same `manifest.scripts` loop that loads the main-movie
+            // scripts) so `new(script("Name"))` can find scripts that live in
+            // external cast libraries. The stem prefix (e.g. "hh_paalu_") avoids
+            // collisions with scripts of the same name in other castlibs.
+            //
+            // The .cct file we walk is the same DirectorFile the C++ player would
+            // load into a slot at runtime, so `cctDirectorFile->castMembers()` is
+            // the authoritative list of cast members and `getScriptForCastMember`
+            // gives us the ScriptChunk for each script member.
+            const std::string castlibScriptStemPrefix = stem + "_";
+            {
+                std::unordered_set<std::string> castlibScriptWritten;
+                std::size_t scriptIndexInCastlib = 0;
+                for (std::size_t i = 0; i < members.size(); ++i) {
+                    const auto& memberChunk = members[i];
+                    if (!memberChunk || !memberChunk->isScript()) continue;
+                    const int memberNumber = static_cast<int>(i + 1);
+                    const auto script = cctDirectorFile->getScriptForCastMember(memberChunk);
+                    if (!script) {
+                        std::cerr << "export_ts: warning: script member " << memberNumber
+                                  << " in " << fileName << " has no ScriptChunk; skipping\n";
+                        continue;
+                    }
+                    // Look up the cast member name for the script (used as the script's
+                    // display name when the script's own scriptName() is empty).
+                    const std::string memberName = memberChunk->name();
+                    ++rec.scriptCount;
+                    try {
+                        ScriptRecord srec = emitScriptModule(
+                            script,
+                            *cctDirectorFile,
+                            *cctDirectorFile,
+                            /*scriptCastLib=*/nullptr,
+                            slot,
+                            memberNumber,
+                            options.outDir,
+                            "src/castlib_scripts/",
+                            castlibScriptStemPrefix,
+                            castlibScriptWritten,
+                            scriptIndexInCastlib++);
+                        // Prefer the cast member's name (more readable than the
+                        // helper's scriptName() fallback) for the manifest entry.
+                        if (!memberName.empty()) srec.name = memberName;
+                        ts << "  { name: \"" << jsonEscape(srec.name) << "\""
+                           << ", castMember: " << memberNumber
+                           << ", file: \"" << jsonEscape(srec.file) << "\" },\n";
+                        // Add to the manifest scripts[] so the runtime's main.ts
+                        // per-script loader (which iterates `manifest.scripts`)
+                        // loads these too. The per-castlib lsScripts[] is also
+                        // populated (above) so castlib-scriptname lookups work.
+                        scripts.push_back(std::move(srec));
+                    } catch (const std::exception& sex) {
+                        std::cerr << "export_ts: warning: script " << memberName
+                                  << " in " << fileName << " failed to emit: "
+                                  << sex.what() << "\n";
+                    }
+                }
+            }
+            ts << "];\n";
+
+            const fs::path castlibPath = options.outDir / rel;
+            std::ofstream out(castlibPath, std::ios::trunc);
+            if (!out) {
+                throw std::runtime_error("Unable to write castlib module: " + rel);
+            }
+            out << ts.str();
+            if (!out) {
+                throw std::runtime_error("Unable to write complete castlib module: " + rel);
+            }
+            castlibs.push_back(std::move(rec));
+            logMemoryUsage("castlib " + rel);
+        }
+        logMemoryUsage("after castlibs (directory walk)");
 
         // --- manifest.json ---------------------------------------------------
         {
@@ -1491,12 +2501,34 @@ int main(int argc, char** argv) {
                     if (i + 1 < scripts.size()) m << ",";
                     m << "\n";
                 }
-                m << "  ]\n";
+                m << "  ],\n";
             }
+            m << "  \"castlibs\": [";
+            if (castlibs.empty()) {
+                m << "],\n";
+            } else {
+                m << "\n";
+                for (std::size_t i = 0; i < castlibs.size(); ++i) {
+                    const auto& cl = castlibs[i];
+                    m << "    { \"number\": " << cl.number
+                      << ", \"name\": \"" << jsonEscape(cl.name) << "\""
+                      << ", \"fileName\": \"" << jsonEscape(cl.fileName) << "\""
+                      << ", \"file\": \"" << jsonEscape(cl.file) << "\""
+                      << ", \"isExternal\": " << (cl.isExternal ? "true" : "false")
+                      << ", \"memberCount\": " << cl.memberCount
+                      << ", \"scriptCount\": " << cl.scriptCount
+                      << " }";
+                    if (i + 1 < castlibs.size()) m << ",";
+                    m << "\n";
+                }
+                m << "  ],\n";
+            }
+            m << "  \"castlibCount\": " << castlibs.size() << "\n";
             m << "}\n";
             std::ofstream mf(options.outDir / "manifest.json", std::ios::trunc);
             mf << m.str();
         }
+        logMemoryUsage("after manifest");
 
         // --- score.json ------------------------------------------------------
         {
@@ -1608,6 +2640,7 @@ int main(int argc, char** argv) {
             std::ofstream sf(options.outDir / "score.json", std::ios::trunc);
             sf << s.str();
         }
+        logMemoryUsage("after score");
 
         // --- cast.json ------------------------------------------------------
         {
@@ -1643,6 +2676,27 @@ int main(int argc, char** argv) {
                 cf << "\n";
             }
             cf << "  ],\n";
+            cf << "  \"castLibraries\": [\n";
+            {
+                std::vector<std::pair<int, std::string>> libs;
+                libs.reserve(player.castLibManager().castLibs().size());
+                for (const auto& [num, castLib] : player.castLibManager().castLibs()) {
+                    if (castLib) {
+                        libs.emplace_back(num, castLib->name());
+                    }
+                }
+                std::sort(libs.begin(), libs.end(),
+                          [](const auto& a, const auto& b) { return a.first < b.first; });
+                for (std::size_t i = 0; i < libs.size(); ++i) {
+                    cf << "    { \"number\": " << libs[i].first
+                       << ", \"name\": \"" << jsonEscape(libs[i].second) << "\" }";
+                    if (i + 1 < libs.size()) {
+                        cf << ",";
+                    }
+                    cf << "\n";
+                }
+            }
+            cf << "  ],\n";
             cf << "  \"sounds\": [\n";
             for (std::size_t i = 0; i < sounds.size(); ++i) {
                 const auto& s = sounds[i];
@@ -1664,6 +2718,7 @@ int main(int argc, char** argv) {
             cf << "  ]\n";
             cf << "}\n";
         }
+        logMemoryUsage("after cast");
 
         std::cout << "Exported " << frameRecords.size() << " frame(s) of "
                   << options.moviePath.filename().string() << " to " << options.outDir.string() << "\n";
