@@ -4,8 +4,8 @@
 //
 // This is a read-only probe over the parsed Director model: it loads a movie
 // (reusing the RenderProbe loading path), renders every frame through the C++
-// pipeline, and serializes the result into a TS project skeleton copied from
-// ts/export-template/ + ts/runtime-template/. It adds no C++ public API and
+// pipeline, and serializes the result into a TS project sourced exclusively
+// from this repository's runtime/ tree. It adds no C++ public API and
 // changes no renderer behavior; it only reads the parsed model and emits data.
 //
 // Stage 2 scope: bitmap sprites with COPY / TRANSPARENT / BLEND inks, baked by
@@ -164,7 +164,7 @@ std::uint64_t fnv1a64(const std::vector<std::uint32_t>& pixels) {
 
 // Recursively copy a source tree into a destination, skipping build artifacts and deps
 // (node_modules / dist / .tsbuildinfo) so the exported project is clean. Mirrors what a
-// developer would commit from the template dirs.
+// developer would commit from the runtime source tree.
 void copyTree(const fs::path& src, const fs::path& dst) {
     if (!fs::exists(src)) {
         throw std::runtime_error("Template source not found: " + src.string());
@@ -197,32 +197,21 @@ void copyTree(const fs::path& src, const fs::path& dst) {
     }
 }
 
-// Assemble the runnable TS project skeleton into the export: the export-template project
-// files (package.json/tsconfig/vite/index.html/src) plus the hand-written runtime copied
-// verbatim under src/runtime/. Paths come from CMake compile-definitions pointing at the
-// in-repo source-of-truth template dirs.
+// Assemble the runnable TS project from the single runtime/ source of truth. Project
+// scaffolding lives under runtime/project/, while the reusable implementation lives under
+// runtime/src/ and is copied verbatim to the exported src/runtime/ directory.
 void copyProjectSkeleton(const fs::path& outDir) {
-#ifndef LIBRESHOCKWAVE_TS_EXPORT_TEMPLATE_DIR
-#define LIBRESHOCKWAVE_TS_EXPORT_TEMPLATE_DIR ""
+#ifndef LIBRESHOCKWAVE_TS_RUNTIME_DIR
+#define LIBRESHOCKWAVE_TS_RUNTIME_DIR ""
 #endif
-#ifndef LIBRESHOCKWAVE_TS_RUNTIME_TEMPLATE_DIR
-#define LIBRESHOCKWAVE_TS_RUNTIME_TEMPLATE_DIR ""
-#endif
-    const fs::path exportTemplate = LIBRESHOCKWAVE_TS_EXPORT_TEMPLATE_DIR;
-    const fs::path runtimeTemplate = LIBRESHOCKWAVE_TS_RUNTIME_TEMPLATE_DIR;
-#undef LIBRESHOCKWAVE_TS_EXPORT_TEMPLATE_DIR
-#undef LIBRESHOCKWAVE_TS_RUNTIME_TEMPLATE_DIR
-    if (!exportTemplate.empty() && fs::exists(exportTemplate)) {
-        copyTree(exportTemplate, outDir);
-    } else {
-        std::cerr << "export_ts: warning: export-template dir not configured; project skeleton not copied.\n";
+    const fs::path runtimeRoot = LIBRESHOCKWAVE_TS_RUNTIME_DIR;
+#undef LIBRESHOCKWAVE_TS_RUNTIME_DIR
+    if (runtimeRoot.empty() || !fs::exists(runtimeRoot)) {
+        throw std::runtime_error("Runtime source not found: " + runtimeRoot.string());
     }
-    if (!runtimeTemplate.empty() && fs::exists(runtimeTemplate)) {
-        fs::create_directories(outDir / "src" / "runtime");
-        copyTree(runtimeTemplate, outDir / "src" / "runtime");
-    } else {
-        std::cerr << "export_ts: warning: runtime-template dir not configured; runtime not copied.\n";
-    }
+    copyTree(runtimeRoot / "project", outDir);
+    fs::create_directories(outDir / "src" / "runtime");
+    copyTree(runtimeRoot / "src", outDir / "src" / "runtime");
 }
 
 // --- pre-bake cast member assets ---------------------------------------------

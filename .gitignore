@@ -1,18 +1,5 @@
-/runtime-template/node_modules
-/export-template/node_modules
 
-# CMake build output
 /build
-/cmake-build-*
-/exported-habbo-dbg
-/exported-habbo
+/runtime/node_modules
 /.vite
-/exported-habbo-r31
-/exported-habbo-r31-2
-/exported-habbo-r31-debug
-/exported-habbo-r31-debug
-/exported-habbo-r31-diag
-/exported-habbo-r31-fresh
-/exported-habbo-r31-test
-/exported-habbo-r31-trace
-/runtime
+/GOAL.md
