@@ -13,6 +13,10 @@ export * from "./lingo-runtime.js";
 export * from "./diff.js";
 export { renderFrame, isSpecialCompositingInk } from "./SoftwareFrameRenderer.js";
 export { RUNTIME_VERSION, RUNTIME_FEATURES, describeRuntimeVersion } from "./version.js";
-export { LingoRuntimeHost, isMemberToken } from "./LingoRuntimeHost.js";
+export {
+  LINGO_HANDLER_NOT_FOUND,
+  LingoRuntimeHost,
+  isMemberToken,
+} from "./LingoRuntimeHost.js";
 export type { MemberToken, LingoRuntimeHostOptions, CastlibRecord } from "./LingoRuntimeHost.js";
 export * from "./network.js";

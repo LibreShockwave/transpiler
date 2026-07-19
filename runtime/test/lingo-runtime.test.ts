@@ -13,9 +13,23 @@ import {
   createMe,
   meProp,
   setMeProp,
+  symbol,
+  value,
+  chunkOf,
+  dispatchValueBuiltin,
+  lingoBinary,
+  SUPPORTED_LINGO_BUILTINS,
   type LingoHost,
   type LingoValue,
 } from "../src/lingo-runtime.js";
+
+describe("line chunks", () => {
+  it("recognizes Director RETURN, Unix LF, and Windows CRLF separators", () => {
+    expect(chunkOf("one\rtwo", "line", 2)).toBe("two");
+    expect(chunkOf("one\ntwo", "line", 2)).toBe("two");
+    expect(chunkOf("one\r\ntwo", "line", 2)).toBe("two");
+  });
+});
 
 describe("integer", () => {
   it("truncates toward zero like C++ static_cast<int>", () => {
@@ -79,6 +93,70 @@ describe("LingoPropList", () => {
     expect(p.get("b")).toBe(2);
     expect(p.has("c")).toBe(false);
     expect(p.get("c")).toBeUndefined();
+  });
+  it("supports the Director addProp method spelling", () => {
+    const p = new LingoPropList();
+    p.addProp("drag", 42);
+    expect(p.getaProp("drag")).toBe(42);
+  });
+  it("returns the final value from getLast", () => {
+    const p = new LingoPropList(["first", 10, "second", 20]);
+    expect(p.getLast()).toBe(20);
+  });
+
+  it("iterates values in insertion order", () => {
+    const p = new LingoPropList(["first", 1, "second", 2]);
+    expect(p.toArray()).toEqual([1, 2]);
+  });
+
+  it("implements indexed mutation and value-to-key lookup", () => {
+    const p = new LingoPropList(["first", 10, "second", 20]);
+    p.setAt(2, 30);
+    expect(p.getAt(2)).toBe(30);
+    expect(p.getOne(30)).toBe("second");
+    expect(p.getFirst()).toBe(10);
+  });
+});
+
+describe("LibreShockwave builtin parity", () => {
+  it("tracks every unique C++ BuiltinRegistry name", () => {
+    expect(SUPPORTED_LINGO_BUILTINS.size).toBe(123);
+  });
+
+  it("dispatches representative math, list, string, type, and geometry builtins", () => {
+    expect(dispatchValueBuiltin("bitAnd", [7, 3])).toEqual({ handled: true, value: 3 });
+    expect(dispatchValueBuiltin("stringReplace", ["a-b-a", "a", "x"]).value).toBe("x-b-x");
+    expect(dispatchValueBuiltin("join", [new LingoList(["a", "b"]), ":"]).value).toBe("a:b");
+    expect(dispatchValueBuiltin("voidP", [undefined]).value).toBe(true);
+    expect((dispatchValueBuiltin("point", [4, 5]).value as LingoList).toArray()).toEqual([4, 5]);
+  });
+});
+
+describe("Lingo binary operators", () => {
+  it("performs vector arithmetic without JavaScript string coercion", () => {
+    expect((lingoBinary("add", new LingoList([1, 2]), new LingoList([3, 4])) as LingoList).toArray())
+      .toEqual([4, 6]);
+    expect((lingoBinary("sub", new LingoList([5, 7]), 2) as LingoList).toArray())
+      .toEqual([3, 5]);
+  });
+
+  it("uses Director string and comparison behavior", () => {
+    expect(lingoBinary("joinPad", "hello", "world")).toBe("hello world");
+    expect(lingoBinary("contains", "Hello World", "world")).toBe(true);
+    expect(lingoBinary("eq", symbol("x"), symbol("x"))).toBe(true);
+  });
+});
+
+describe("value", () => {
+  it("parses nested Director layout property lists", () => {
+    const parsed = value(
+      '[#member: "null", #media: #bitmap, #loc: [1, 2], #color: rgb(3, 4, 5)]',
+    ) as LingoPropList;
+    expect(parsed).toBeInstanceOf(LingoPropList);
+    expect(parsed.get(symbol("member"))).toBe("null");
+    expect(parsed.get(symbol("media"))).toBe(symbol("bitmap"));
+    expect((parsed.get(symbol("loc")) as LingoList).toArray()).toEqual([1, 2]);
+    expect((parsed.get(symbol("color")) as LingoList).toArray()).toEqual([3, 4, 5]);
   });
 });
 

@@ -11,7 +11,11 @@ import {
 } from "./runtime/ScoreData.js";
 import { ScorePlayer } from "./runtime/ScorePlayer.js";
 import { renderFrame } from "./runtime/SoftwareFrameRenderer.js";
-import { LingoRuntimeHost, setLingoHost } from "./runtime/index.js";
+import {
+  LINGO_HANDLER_NOT_FOUND,
+  LingoRuntimeHost,
+  setLingoHost,
+} from "./runtime/index.js";
 import { setNetworkBaseUrl, setPreloadedCastFiles } from "./runtime/network.js";
 
 interface Manifest {
@@ -322,6 +326,19 @@ void (async () => {
       return invokeInstance(owner.module, owner.handler.name, me, args);
     };
   }
+  host.setGlobalDispatcher((name, args) => {
+    const owner = [...globalHandlerOwners.entries()].find(
+      ([candidate]) => candidate.toLowerCase() === name.toLowerCase(),
+    )?.[1];
+    if (!owner) return LINGO_HANDLER_NOT_FOUND as unknown as runtime.LingoValue;
+    const me = instanceFor(
+      owner.module,
+      0,
+      movieInstances,
+      `global:${owner.module.lsScriptName}`,
+    );
+    return invokeInstance(owner.module, owner.handler.name, me, args);
+  });
 
   let frameIndex = 0;
   let activeBehaviors = new Map<string, ScoreBehaviorJson>();

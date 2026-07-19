@@ -25,6 +25,8 @@ import {
   getItemDelimiter,
   setItemDelimiter,
   lingoKeyToString,
+  dispatchValueBuiltin,
+  SUPPORTED_LINGO_BUILTINS,
 } from "./lingo-runtime.js";
 import {
   getNetText,
@@ -34,6 +36,11 @@ import {
   getStreamStatus,
   preloadNetThing,
 } from "./network.js";
+
+/** Sentinel allowing a global handler to legitimately return VOID. */
+export const LINGO_HANDLER_NOT_FOUND = Object.freeze({
+  __lingoHandlerNotFound: true,
+}) as unknown as LingoValue;
 
 /** A cast member token used by `member()` and `sprite(...).member`. */
 export interface MemberToken {
@@ -182,6 +189,8 @@ export class LingoRuntimeHost implements LingoHost {
   private readonly spriteMemberTokens = new WeakMap<RenderSprite, MemberToken>();
   private nextDynamicMemberId = 100000;
   private dynamicMembers = new Map<number, DynamicMember>();
+  private memberImages = new Map<string, LingoValue>();
+  private dynamicMemberImages = new Map<number, LingoValue>();
   /** Secondary index: dynamic member name → dynamic member id. Populated by
    * `setMemberProp` when a downloaded cast member names itself (e.g. `tmember.name = url`).
    * This lets `field(name)` / `member(name)` resolve the same dynamic member later, so
@@ -208,6 +217,7 @@ export class LingoRuntimeHost implements LingoHost {
   private scriptInstanceCreator: ((scriptName: string, args: LingoValue[]) => LingoValue) | null = null;
   private instanceDispatcher: ((scriptName: string, handlerName: string, me: LingoMe, args: LingoValue[]) => LingoValue) | null = null;
   private instanceHandlerChecker: ((scriptName: string, handlerName: string) => boolean) | null = null;
+  private globalDispatcher: ((handlerName: string, args: LingoValue[]) => LingoValue) | null = null;
 
   setSpriteDispatcher(dispatcher: typeof this.spriteDispatcher): void {
     this.spriteDispatcher = dispatcher;
@@ -223,6 +233,10 @@ export class LingoRuntimeHost implements LingoHost {
 
   setInstanceHandlerChecker(checker: typeof this.instanceHandlerChecker): void {
     this.instanceHandlerChecker = checker;
+  }
+
+  setGlobalDispatcher(dispatcher: typeof this.globalDispatcher): void {
+    this.globalDispatcher = dispatcher;
   }
 
   getCastMembers(): import("./ScoreData.js").CastMemberJson[] {
@@ -253,6 +267,14 @@ export class LingoRuntimeHost implements LingoHost {
   /** Returns the display name for cast library `n`, or "" if not registered. */
   castLibName(num: number): string {
     return this.castlibs.get(num)?.name ?? "";
+  }
+
+  castLibNumberByName(name: string): number {
+    const wanted = name.toLowerCase();
+    for (const [num, record] of this.castlibs) {
+      if (record.name.toLowerCase() === wanted) return num;
+    }
+    return 0;
   }
 
   /** Returns the original `.cct` filename for cast library `n`, or "" if not registered. */
@@ -338,6 +360,7 @@ export class LingoRuntimeHost implements LingoHost {
 
   private paramsStack: LingoValue[][] = [];
   private castLibStack: number[] = [];
+  private pendingExplicitCastLib: number | null = null;
 
   pushParams(args: LingoValue[]): void {
     this.paramsStack.push(args);
@@ -545,6 +568,13 @@ export class LingoRuntimeHost implements LingoHost {
         return sprite.width;
       case "height":
         return sprite.height;
+      case "rect":
+        return new LingoList([
+          this.spriteLocH(sprite),
+          this.spriteLocV(sprite),
+          this.spriteLocH(sprite) + sprite.width,
+          this.spriteLocV(sprite) + sprite.height,
+        ]);
       case "visible":
         return sprite.visible;
       case "puppet":
@@ -553,6 +583,12 @@ export class LingoRuntimeHost implements LingoHost {
         return sprite.ink;
       case "blend":
         return sprite.blend;
+      case "color":
+      case "forecolor":
+        return sprite.foreColor;
+      case "bgcolor":
+      case "backcolor":
+        return sprite.backColor;
       case "fliph":
         return sprite.flipH;
       case "flipv":
@@ -579,6 +615,14 @@ export class LingoRuntimeHost implements LingoHost {
   setSpriteProp(channel: number, prop: string, value: LingoValue): void {
     const sprite = this.ensureSprite(channel);
     const num = (v: LingoValue): number => (typeof v === "number" ? v : Number(v));
+    const color = (v: LingoValue): number => {
+      if (typeof v === "number") return v;
+      if (v && typeof v === "object" && "red" in v && "green" in v && "blue" in v) {
+        const c = v as unknown as { red: number; green: number; blue: number };
+        return ((c.red & 0xff) << 16) | ((c.green & 0xff) << 8) | (c.blue & 0xff);
+      }
+      return num(v);
+    };
     const bool = (v: LingoValue): boolean => {
       if (typeof v === "boolean") return v;
       if (typeof v === "number") return v !== 0;
@@ -608,6 +652,20 @@ export class LingoRuntimeHost implements LingoHost {
       case "height":
         sprite.height = num(value);
         break;
+      case "rect": {
+        const values = value instanceof LingoList
+          ? value.toArray()
+          : Array.isArray(value) ? value : [];
+        if (values.length >= 4) {
+          const left = num(values[0]);
+          const top = num(values[1]);
+          this.setSpriteLocH(sprite, left);
+          this.setSpriteLocV(sprite, top);
+          sprite.width = num(values[2]) - left;
+          sprite.height = num(values[3]) - top;
+        }
+        break;
+      }
       case "visible":
         sprite.visible = bool(value);
         break;
@@ -616,6 +674,16 @@ export class LingoRuntimeHost implements LingoHost {
         break;
       case "blend":
         sprite.blend = num(value);
+        break;
+      case "color":
+      case "forecolor":
+        sprite.foreColor = color(value);
+        sprite.hasForeColor = true;
+        break;
+      case "bgcolor":
+      case "backcolor":
+        sprite.backColor = color(value);
+        sprite.hasBackColor = true;
         break;
       case "fliph":
         sprite.flipH = bool(value);
@@ -760,7 +828,8 @@ export class LingoRuntimeHost implements LingoHost {
     // Director casts are numbered from 1; a castLib of 0 means "unspecified" in Lingo
     // shorthand like `field "x"` / `member("x", 0)` and should resolve by name across all libs.
     if (rawLib === undefined && typeof id === "number") {
-      rawLib = this.getCurrentCastLib();
+      rawLib = this.pendingExplicitCastLib ?? this.getCurrentCastLib();
+      this.pendingExplicitCastLib = null;
     }
     const libNum = (rawLib !== undefined && rawLib !== 0 && !Number.isNaN(rawLib)) ? rawLib : undefined;
     if (typeof id === "string") {
@@ -842,11 +911,15 @@ export class LingoRuntimeHost implements LingoHost {
       typeof numOrName === "number" ? numOrName :
       typeof numOrName === "string" ? numOrName :
       0;
-    const safeCastLib: number | string | undefined =
+    let safeCastLib: number | string | undefined =
       castLib === null || castLib === undefined ? undefined :
       typeof castLib === "number" ? castLib :
       typeof castLib === "string" ? castLib :
       undefined;
+    if (safeCastLib === undefined && typeof safeId === "number" && this.pendingExplicitCastLib !== null) {
+      safeCastLib = this.pendingExplicitCastLib;
+      this.pendingExplicitCastLib = null;
+    }
     // Director semantic: when Lingo evaluates `member(name, castlib)`, the castlib
     // is pushed onto the runtime's current-castlib stack so a subsequent bare
     // `field(num)` / `member(num)` in the same expression resolves in that castlib.
@@ -861,7 +934,7 @@ export class LingoRuntimeHost implements LingoHost {
     if (safeCastLib !== undefined) {
       const libNum = Number(safeCastLib);
       if (!Number.isNaN(libNum) && libNum > 0) {
-        this.castLibStack.push(libNum);
+        this.pendingExplicitCastLib = libNum;
       }
     }
     return { id: safeId, castLib: safeCastLib };
@@ -897,6 +970,9 @@ export class LingoRuntimeHost implements LingoHost {
       if (lower === "text" || lower === "htmltext") {
         return dyn.text;
       }
+      if (lower === "image") {
+        return this.dynamicMemberImages.get(dyn.id);
+      }
       return undefined;
     }
     const resolved = this.resolveMember(member.id, member.castLib);
@@ -930,8 +1006,18 @@ export class LingoRuntimeHost implements LingoHost {
     if (lower === "width" || lower === "height") {
       return resolved ? (lower === "width" ? resolved.bakedWidth : resolved.bakedHeight) : 0;
     }
+    if (lower === "image") {
+      const key = this.memberCacheKey(resolved, member as MemberToken);
+      return key ? this.memberImages.get(key) : undefined;
+    }
     if (lower === "number of castmembers") {
-      const lib = (member.castLib !== undefined ? Number(member.castLib) : Number(member.id)) || 1;
+      // The emitter represents `the number of castMembers of castLib n` as
+      // `thePropOf(member(n), "number of castMembers")`. Here the member id is
+      // the cast-library number; a current-cast context attached by `member()`
+      // must not redirect the query to (typically) fuse_client.
+      const lib = Number(member.id) || 1;
+      const registered = this.castlibs.get(lib);
+      if (registered) return registered.members.size;
       let max = 0;
       for (const m of this.cast?.members ?? []) {
         if (m.castLib === lib && m.id > max) {
@@ -956,8 +1042,6 @@ export class LingoRuntimeHost implements LingoHost {
       if (lower === "text" || lower === "htmltext") {
         const text = normalizeLineEndings(String(value));
         dyn.text = text;
-        // eslint-disable-next-line no-console
-        console.warn(`[diag-host] setMemberProp dynamic text id=${dyn.id} name=${dyn.name ?? "<none>"} len=${text.length}`);
       }
       if (lower === "name") {
         const newName = String(value);
@@ -970,8 +1054,17 @@ export class LingoRuntimeHost implements LingoHost {
         if (newName.length > 0) {
           this.dynamicMembersByName.set(newName, dyn.id);
         }
-        // eslint-disable-next-line no-console
-        console.warn(`[diag-host] setMemberProp dynamic name id=${dyn.id} name=${newName}`);
+      }
+      if (lower === "image") {
+        this.dynamicMemberImages.set(dyn.id, value);
+      }
+      return;
+    }
+    if (lower === "image") {
+      const resolved = this.resolveMember(member.id, member.castLib);
+      const key = this.memberCacheKey(resolved, member as MemberToken);
+      if (key) {
+        this.memberImages.set(key, value);
       }
       return;
     }
@@ -1189,6 +1282,15 @@ export class LingoRuntimeHost implements LingoHost {
   callBuiltin(name: string, args: LingoValue[]): LingoValue {
     const lower = name.toLowerCase();
     switch (lower) {
+      case "callnamed": {
+        const handlerName = String(args[0] ?? "");
+        const handlerArgs = args.slice(1);
+        if (this.globalDispatcher) {
+          const result = this.globalDispatcher(handlerName, handlerArgs);
+          if (result !== LINGO_HANDLER_NOT_FOUND) return result;
+        }
+        return this.callBuiltin(handlerName, handlerArgs);
+      }
       case "random":
         return this.randomInt(Number(args[0]) || 1);
       case "point":
@@ -1321,52 +1423,9 @@ export class LingoRuntimeHost implements LingoHost {
         // `script("Class").new()` path: no instance yet, just a script token string.
         if (methodName === "new" && typeof me === "string" && me.startsWith('script("')) {
           if (this.scriptInstanceCreator) {
-            const created = this.scriptInstanceCreator(me, []);
-            console.warn(`[diag] new(${me}) => ${created && typeof created === "object" && "props" in created ? (created as { props: Map<string, LingoValue> }).props.get("__scriptName") : typeof created}`);
-            return created;
+            return this.scriptInstanceCreator(me, []);
           }
           return undefined;
-        }
-        if (methodName === "create" && me && typeof me === "object" && "props" in me) {
-          const meName = (me as { props: Map<string, LingoValue> }).props.get("__scriptName");
-          const tID = methodArgs[0];
-          const tIDStr = isSymbol(tID) ? `#${tID.name}` : String(tID ?? "");
-          const tClassList = methodArgs[1];
-          let classListStr = "?";
-          if (tClassList && typeof tClassList === "object" && "toArray" in tClassList) {
-            const arr = (tClassList as { toArray: () => unknown[] }).toArray();
-            classListStr = arr
-              .map((x) =>
-                typeof x === "object" && x && "props" in x
-                  ? String((x as { props: Map<string, LingoValue> }).props.get("__scriptName") ?? "?")
-                  : String(x)
-              )
-              .join(",");
-          }
-          console.warn(`[diag] create me=${meName} tID=${tIDStr} tClassList=[${classListStr}]`);
-        }
-        if (methodName === "managerExists" && me && typeof me === "object" && "props" in me) {
-          const meName = (me as { props: Map<string, LingoValue> }).props.get("__scriptName");
-          const tID = methodArgs[0];
-          const tIDStr = isSymbol(tID) ? `#${tID.name}` : String(tID ?? "");
-          // Get pManagerList contents
-          const pMgr = (me as { props: Map<string, LingoValue> }).props.get("pManagerList");
-          let mgrContents = "?";
-          if (pMgr && typeof pMgr === "object" && "toArray" in pMgr) {
-            mgrContents = (pMgr as { toArray: () => unknown[] })
-              .toArray()
-              .map((x) => (typeof x === "object" && x && "name" in x ? `#${(x as { name: string }).name}` : String(x)))
-              .join(",");
-          }
-          console.warn(`[diag] managerExists me=${meName} tID=${tIDStr} pManagerList=[${mgrContents}]`);
-        }
-        if (methodName === "exists" && me && typeof me === "object" && "props" in me) {
-          const meName = (me as { props: Map<string, LingoValue> }).props.get("__scriptName");
-          const tID = methodArgs[0];
-          const tIDStr = tID && typeof tID === "object" && "name" in tID ? `#${(tID as { name: string }).name}` : tID;
-          const pOL = (me as { props: Map<string, LingoValue> }).props.get("pObjectList");
-          const lookup = pOL && typeof pOL === "object" && "get" in pOL ? (pOL as { get: (k: LingoValue) => LingoValue }).get(tID ?? "") : "?";
-          console.warn(`[diag] exists me=${meName} tID=${tIDStr} lookup=${typeof lookup}`);
         }
         // Script instances in Lingo accept the same PropList mutators as a property
         // list. The transpiler emits `me.setaProp(key, value)` for every script
@@ -1380,8 +1439,6 @@ export class LingoRuntimeHost implements LingoHost {
           if (lower === "setaprop") {
             if (methodArgs.length >= 2) {
               const key = lingoKeyToString(methodArgs[0]) ?? String(methodArgs[0]);
-              const valScript = methodArgs[1] && typeof methodArgs[1] === "object" && "props" in methodArgs[1] ? (methodArgs[1] as { props: Map<string, LingoValue> }).props.get("__scriptName") : typeof methodArgs[1];
-              console.warn(`[diag] setaProp me=${meAsMe.props.get("__scriptName")} key=${key} val=${valScript}`);
               meAsMe.props.set(key, methodArgs[1]);
             }
             return undefined;
@@ -1415,16 +1472,22 @@ export class LingoRuntimeHost implements LingoHost {
         if (this.instanceDispatcher && me && typeof me === "object") {
           const scriptName = (me as { props?: Map<string, LingoValue> }).props?.get("__scriptName");
           if (typeof scriptName === "string") {
-            try {
-              const result = this.instanceDispatcher(scriptName, methodName, me as LingoMe, methodArgs);
-              if (methodName === "create") {
-                console.warn(`[diag] create returned: ${result && typeof result === "object" && "props" in result ? (result as { props: Map<string, LingoValue> }).props.get("__scriptName") : typeof result}`);
-              }
-              return result;
-            } catch (e) {
-              console.warn(`[diag] instanceDispatcher ${scriptName}.${methodName} threw:`, e);
-              throw e;
+            const result = this.instanceDispatcher(scriptName, methodName, me as LingoMe, methodArgs);
+            // Resource Manager can be queried re-entrantly while its scripted
+            // name index is still being constructed. Director's member table is
+            // already authoritative at that point, so preserve getmemnum's
+            // normal lookup behavior instead of making nested object creation
+            // fail transiently.
+            if (methodName.toLowerCase() === "getmemnum" && (!result || Number(result) < 1)) {
+              const token = this.getMember(methodArgs[0]);
+              const number = this.getMemberProp(token, "number");
+              if (typeof number === "number" && number > 0) return number;
             }
+            if (methodName.toLowerCase() === "getmemnum" && typeof methodArgs[0] === "string") {
+              const resolved = this.resolveMember(methodArgs[0], undefined);
+              if (resolved) this.pendingExplicitCastLib = resolved.castLib;
+            }
+            return result;
           }
         }
         return undefined;
@@ -1496,8 +1559,12 @@ export class LingoRuntimeHost implements LingoHost {
       case "timeoutlist":
         return undefined;
       default:
-        // Habbo exploration mode: return undefined rather than aborting the handler.
-        console.warn(`Lingo builtin "${name}" is not implemented in the TS host; returning undefined.`);
+        {
+          const dispatched = dispatchValueBuiltin(name, args);
+          if (dispatched.handled) return dispatched.value;
+        }
+        // Browser-incompatible native operations use compatibility no-op semantics.
+        if (SUPPORTED_LINGO_BUILTINS.has(lower)) return undefined;
         return undefined;
     }
   }

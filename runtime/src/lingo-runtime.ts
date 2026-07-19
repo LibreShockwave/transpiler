@@ -210,6 +210,14 @@ export class LingoList {
     return this.items.length > 0 ? this.items[this.items.length - 1] : undefined;
   }
 
+  getFirst(): LingoValue {
+    return this.items.length > 0 ? this.items[0] : undefined;
+  }
+
+  join(separator: LingoValue = "&"): string {
+    return this.items.map((item) => lingoValueToString(item)).join(lingoValueToString(separator));
+  }
+
   setAt(index: number, value: LingoValue): void {
     this.set(index, value);
   }
@@ -373,6 +381,11 @@ export class LingoPropList {
     this.vals.push(value);
   }
 
+  /** Director method spelling used by emitted `propList.addProp(key, value)`. */
+  addProp(key: LingoValue, value: LingoValue): void {
+    this.add(key, value);
+  }
+
   get(key: LingoValue): LingoValue {
     const i = this.findKeyIndex(key);
     if (i < 0) {
@@ -432,6 +445,44 @@ export class LingoPropList {
     this.vals.splice(index - 1, 1);
   }
 
+  getLast(): LingoValue {
+    return this.vals.length > 0 ? this.vals[this.vals.length - 1] : undefined;
+  }
+
+  getFirst(): LingoValue {
+    return this.vals.length > 0 ? this.vals[0] : undefined;
+  }
+
+  getAt(indexOrKey: LingoValue): LingoValue {
+    if (typeof indexOrKey === "number" && Number.isInteger(indexOrKey)) {
+      return indexOrKey >= 1 && indexOrKey <= this.vals.length
+        ? this.vals[indexOrKey - 1]
+        : this.get(String(indexOrKey));
+    }
+    return this.get(indexOrKey);
+  }
+
+  setAt(indexOrKey: LingoValue, value: LingoValue): void {
+    if (
+      typeof indexOrKey === "number" &&
+      Number.isInteger(indexOrKey) &&
+      indexOrKey >= 1 &&
+      indexOrKey <= this.vals.length
+    ) {
+      this.vals[indexOrKey - 1] = value;
+      return;
+    }
+    this.add(
+      typeof indexOrKey === "number" ? String(indexOrKey) : indexOrKey,
+      value,
+    );
+  }
+
+  getOne(value: LingoValue): LingoValue {
+    const index = this.vals.findIndex((item) => lingoValuesEqual(item, value));
+    return index >= 0 ? this.keys[index] : 0;
+  }
+
   sort(): this {
     const pairs = this.keys.map((k, i) => [k, this.vals[i]] as [string, LingoValue]);
     pairs.sort((a, b) => a[0].localeCompare(b[0]));
@@ -450,6 +501,11 @@ export class LingoPropList {
       copy.add(this.keys[i], duplicate(this.vals[i]));
     }
     return copy;
+  }
+
+  /** Values in Director insertion order (`repeat with item in propList`). */
+  toArray(): LingoValue[] {
+    return [...this.vals];
   }
 }
 
@@ -697,6 +753,8 @@ export class LingoMemberProxy {
 
   get width(): number { return Number(this.host.getMemberProp(this.token, "width")) || 0; }
   get height(): number { return Number(this.host.getMemberProp(this.token, "height")) || 0; }
+  get image(): LingoValue { return this.host.getMemberProp(this.token, "image"); }
+  set image(v: LingoValue) { this.host.setMemberProp(this.token, "image", v); }
 
   /** Director member types: #bitmap, #field, #text, #script, #sound, etc. */
   get type(): LingoSymbol {
@@ -780,6 +838,11 @@ export function setTheProperty(name: string, value: LingoValue): void {
 /** Call a Lingo builtin through the host. */
 export function callBuiltin(name: string, ...args: LingoValue[]): LingoValue {
   return requireHost().callBuiltin(name, args);
+}
+
+/** Resolve a bare Lingo call as a movie/global handler first, then as a builtin. */
+export function callNamed(name: string, ...args: LingoValue[]): LingoValue {
+  return requireHost().callBuiltin("callNamed", [name, ...args]);
 }
 
 /** `me` context: property ivars and the spriteNum for behavior instances. */
@@ -944,6 +1007,27 @@ export function thePropOf(obj: LingoValue, prop: string): LingoValue {
   if (obj instanceof LingoMemberProxy) {
     return obj.host.getMemberProp(obj.token, prop);
   }
+  if (obj instanceof LingoCastLibProxy) {
+    return (obj as unknown as Record<string, LingoValue>)[prop.toLowerCase() === "filename" ? "fileName" : prop];
+  }
+  if (obj instanceof LingoList) {
+    if (prop.toLowerCase() === "ilk") return symbol("list");
+    if (prop.toLowerCase() === "count" || prop.toLowerCase() === "length") return obj.count;
+  }
+  if (obj instanceof LingoPropList) {
+    if (prop.toLowerCase() === "ilk") return symbol("propList");
+    if (prop.toLowerCase() === "count" || prop.toLowerCase() === "length") return obj.count;
+    return obj.get(prop);
+  }
+  if (typeof obj === "string" && prop.toLowerCase() === "length") {
+    return obj.length;
+  }
+  if (obj !== null && typeof obj === "object" && "props" in obj) {
+    return meProp(obj as LingoMe, prop);
+  }
+  if (obj !== null && typeof obj === "object") {
+    return (obj as Record<string, LingoValue>)[prop];
+  }
   return undefined;
 }
 
@@ -969,6 +1053,10 @@ export function setThePropOf(obj: LingoValue, prop: string, value: LingoValue): 
     setMeProp(obj as LingoMe, prop, value);
     return;
   }
+  if (obj instanceof LingoPropList) {
+    obj.setaProp(prop, value);
+    return;
+  }
   // Director `the stage` is returned as a plain stage-object proxy; allow Lingo like
   // `(the stage).title = ...` to set properties on it directly.
   if (
@@ -980,6 +1068,9 @@ export function setThePropOf(obj: LingoValue, prop: string, value: LingoValue): 
   ) {
     (obj as Record<string, LingoValue>)[prop] = value;
     return;
+  }
+  if (obj !== null && typeof obj === "object") {
+    (obj as Record<string, LingoValue>)[prop] = value;
   }
 }
 
@@ -1064,41 +1155,13 @@ function bootstrapGetManager(me: LingoMe, tID: LingoValue): LingoValue {
 }
 
 /** Object method call used by the transpiler for V4-style `obj.handler(args)`. */
-const diagCallMethodNames = new Set(["preIndexMembers", "dump", "updateState", "create"]);
-
 export function callMethod(name: string, ...args: LingoValue[]): LingoValue {
   if (args.length > 0) {
     const me = args[0];
     if (me !== null && typeof me === "object") {
       const fn = (me as Record<string, unknown>)[name];
       if (typeof fn === "function") {
-        const diag = diagCallMethodNames.has(name);
-        if (diag) {
-          // eslint-disable-next-line no-console
-          console.warn(`[diag-callMethod] ENTER ${name} me=${diagObjectDescriptor(me)}`);
-        }
-        try {
-          const result = (fn as (...a: unknown[]) => unknown).apply(me, args.slice(1)) as LingoValue;
-          if (diag) {
-            // eslint-disable-next-line no-console
-            console.warn(`[diag-callMethod] EXIT ${name} result=${result}`);
-          }
-          return result;
-        } catch (e) {
-          if (diag) {
-            // eslint-disable-next-line no-console
-            console.warn(`[diag-callMethod] THROW ${name} error=${e}`);
-          }
-          throw e;
-        }
-      }
-      if (name === "removeActiveTask" || name === "importFileToCast" || name === "setaProp" || name === "updateState" || name === "Activate" || name === "addCallBack" || name === "deconstruct" || name === "update" || name === "deleteAt" || name === "add" || name === "getProperty" || name === "startCastLoad") {
-        // eslint-disable-next-line no-console
-        console.warn(`[diag-callMethod] name=${name} meType=${typeof me} hasProps=${"props" in (me as object)} scriptName=${(me as { props?: { get?: (k: string) => unknown } }).props?.get?.("__scriptName") ?? "?"} fnType=${typeof fn}`);
-      }
-      if (name === "removeActiveTask" && (me as { props?: { get?: (k: string) => unknown } }).props?.get?.("__scriptName") === "Download Manager Class") {
-        // eslint-disable-next-line no-console
-        console.warn(`[diag-callMethod-DM] ENTER removeActiveTask via callMethod fallback`);
+        return (fn as (...a: unknown[]) => unknown).apply(me, args.slice(1)) as LingoValue;
       }
       // Bootstrap fix: managers may be re-entered while their instance is already
       // in pObjectList but not yet moved to pManagerList. Treat pObjectList
@@ -1135,16 +1198,11 @@ export function script(nameOrNum: LingoValue): string {
   let resolved: string;
   if (typeof nameOrNum === "number") {
     try {
-      const host = getLingoHost();
-      const members = host?.getCastMembers?.() ?? [];
-      let scriptName = "";
-      for (const m of members) {
-        if (m.id === nameOrNum && m.type === "script" && m.name) {
-          scriptName = m.name;
-          break;
-        }
-      }
-      resolved = scriptName || member(nameOrNum).name;
+      // Numeric member ids are only unique within a cast. `getmemnum(name)`
+      // leaves an explicit cast hint in the host; resolving through member()
+      // consumes that hint and avoids selecting the first same-numbered script
+      // from an unrelated cast library.
+      resolved = member(nameOrNum).name;
     } catch {
       resolved = String(nameOrNum);
     }
@@ -1160,12 +1218,70 @@ export function script(nameOrNum: LingoValue): string {
 
 /** `sprite a intersects sprite b` */
 export function spriteIntersects(_a: LingoValue, _b: LingoValue): boolean {
-  return false;
+  return !!callMethod("intersects", _a, _b);
 }
 
 /** `sprite a within sprite b` */
 export function spriteWithin(_a: LingoValue, _b: LingoValue): boolean {
-  return false;
+  return !!callMethod("within", _a, _b);
+}
+
+function valueVector(value: LingoValue): LingoValue[] | null {
+  if (value instanceof LingoList) return value.toArray();
+  if (Array.isArray(value)) return [...value] as LingoValue[];
+  return null;
+}
+
+/** Execute binary operators with Director value/coercion semantics. */
+export function lingoBinary(
+  operator: string,
+  left: LingoValue,
+  right: LingoValue,
+): LingoValue {
+  const op = operator.toLowerCase();
+  if (op === "contains") return contains(left, right);
+  if (op === "starts") return starts(left, right);
+  if (op === "join") return lingoValueToString(left) + lingoValueToString(right);
+  if (op === "joinpad") return lingoValueToString(left) + " " + lingoValueToString(right);
+  if (op === "and") return lingoTruthy(left) && lingoTruthy(right);
+  if (op === "or") return lingoTruthy(left) || lingoTruthy(right);
+  if (op === "eq" || op === "neq") {
+    const equal = lingoValuesEqual(left, right);
+    return op === "eq" ? equal : !equal;
+  }
+  const leftVector = valueVector(left);
+  const rightVector = valueVector(right);
+  if ((op === "add" || op === "sub") && (leftVector || rightVector)) {
+    const a = leftVector ?? [];
+    const b = rightVector ?? [];
+    const length = Math.max(a.length, b.length);
+    return new LingoList(Array.from({ length }, (_, index) => {
+      const av = leftVector ? float(a[index]) : float(left);
+      const bv = rightVector ? float(b[index]) : float(right);
+      return op === "add" ? av + bv : av - bv;
+    }));
+  }
+  const a = float(left);
+  const b = float(right);
+  switch (op) {
+    case "add": return a + b;
+    case "sub": return a - b;
+    case "mul": return a * b;
+    case "div": return b === 0 ? 0 : a / b;
+    case "mod": return b === 0 ? 0 : a % b;
+    case "lt": return a < b;
+    case "lte": return a <= b;
+    case "gt": return a > b;
+    case "gte": return a >= b;
+    default: return undefined;
+  }
+}
+
+export function lingoTruthy(value: LingoValue): boolean {
+  if (value === undefined || value === null || value === false) return false;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") return value.length > 0;
+  return true;
 }
 
 /** Global variable read. */
@@ -1273,7 +1389,10 @@ function splitChunks(value: string, type: string): string[] {
     case "item":
       return value === "" ? [] : value.split(itemDelimiter);
     case "line":
-      return value === "" ? [] : value.split(/\r?\n/);
+      // Director text members conventionally use RETURN (`\r`) separators,
+      // while browser/network text may use LF or CRLF. All three delimit a
+      // Lingo line; keep CRLF together so it does not create an empty line.
+      return value === "" ? [] : value.split(/\r\n|\r|\n/);
     default:
       return [value];
   }
@@ -1505,6 +1624,9 @@ export function getAt(value: LingoValue, index: LingoValue): LingoValue {
   if (value instanceof LingoList) {
     return value.get(i);
   }
+  if (value instanceof LingoPropList) {
+    return value.getAt(index);
+  }
   if (Array.isArray(value)) {
     return value[i - 1];
   }
@@ -1515,6 +1637,8 @@ export function setAt(value: LingoValue, index: LingoValue, item: LingoValue): v
   const i = integer(index);
   if (value instanceof LingoList) {
     value.set(i, item);
+  } else if (value instanceof LingoPropList) {
+    value.setAt(index, item);
   } else if (Array.isArray(value)) {
     (value as LingoValue[])[i - 1] = item;
   }
@@ -1608,23 +1732,52 @@ export function deleteAt(list: LingoValue, index: LingoValue): void {
 
 /** `getLast(list)` — return the last element of a LingoList. */
 export function getLast(list: LingoValue): LingoValue {
-  if (list instanceof LingoList) {
+  if (list instanceof LingoList || list instanceof LingoPropList) {
     return list.getLast();
   }
   return undefined;
 }
 
-/** `getOne(list, value)` / `getPos(list, value)` / `findPos(list, value)`. */
-export function getOne(list: LingoValue, value: LingoValue): number {
+export function getFirst(list: LingoValue): LingoValue {
+  if (list instanceof LingoList || list instanceof LingoPropList) {
+    return list.getFirst();
+  }
+  return undefined;
+}
+
+export function deleteOne(list: LingoValue, value: LingoValue): LingoValue {
   if (list instanceof LingoList) {
+    const found = list.getOne(value) !== 0;
+    list.deleteOne(value);
+    return found;
+  }
+  return false;
+}
+
+export function join(listValue: LingoValue, separator: LingoValue = "&"): string {
+  if (listValue instanceof LingoList) return listValue.join(separator);
+  if (Array.isArray(listValue)) {
+    return listValue.map((item) => lingoValueToString(item as LingoValue))
+      .join(lingoValueToString(separator));
+  }
+  return "";
+}
+
+/** `getOne(list, value)` / `getPos(list, value)` / `findPos(list, value)`. */
+export function getOne(list: LingoValue, value: LingoValue): LingoValue {
+  if (list instanceof LingoList) {
+    return list.getOne(value);
+  }
+  if (list instanceof LingoPropList) {
     return list.getOne(value);
   }
   return 0;
 }
-export function getPos(list: LingoValue, value: LingoValue): number {
+export function getPos(list: LingoValue, value: LingoValue): LingoValue {
   return getOne(list, value);
 }
-export function findPos(list: LingoValue, value: LingoValue): number {
+export function findPos(list: LingoValue, value: LingoValue): LingoValue {
+  if (list instanceof LingoPropList) return list.findPos(value) || undefined;
   return getOne(list, value);
 }
 
@@ -1770,32 +1923,13 @@ export function ilk(value: LingoValue, expectedType?: LingoValue): LingoSymbol |
   return symbol(typeName);
 }
 
-function diagObjectDescriptor(value: LingoValue): string {
-  if (value === null || value === undefined) return String(value);
-  if (typeof value !== "object") return typeof value;
-  const rec = value as Record<string, unknown>;
-  if ("__scriptName" in rec) return String(rec.__scriptName);
-  const props = (value as { props?: Map<string, unknown> }).props;
-  if (props?.has("__scriptName")) return String(props.get("__scriptName"));
-  if ("id" in rec) return String(rec.id);
-  return (value as object).constructor?.name ?? "object";
-}
-
 /** `call(#handler, targetOrList, ...args)` — dispatch a handler to one or more objects. */
 export function call(handler: LingoValue, target: LingoValue, ...args: LingoValue[]): LingoValue {
   const name = isSymbol(handler) ? handler.name : typeof handler === "string" ? handler : "";
-  if (name === "assetDownloadCallbacks") {
-    // eslint-disable-next-line no-console
-    console.warn(`[diag-call] name=${name} targetType=${target === null ? "null" : typeof target} targetIsObject=${target && typeof target === "object"} targetHasProps=${target && typeof target === "object" && "props" in target} argCount=${args.length}`);
-  }
   if (target instanceof LingoList) {
     const results: LingoValue[] = [];
     for (let i = 1; i <= target.count; i++) {
       const item = target.get(i);
-      if (name === "prepare" || name === "update") {
-        // eslint-disable-next-line no-console
-        console.warn(`[diag-call] ${name} #${i}/${target.count} obj=${diagObjectDescriptor(item)}`);
-      }
       results.push(callMethod(name, item, ...args));
     }
     return new LingoList(results);
@@ -1808,10 +1942,6 @@ export function call(handler: LingoValue, target: LingoValue, ...args: LingoValu
     for (let i = 1; i <= target.count; i++) {
       const value = target.get(target.getPropAt(i));
       if (value === undefined) continue;
-      if (name === "prepare" || name === "update") {
-        // eslint-disable-next-line no-console
-        console.warn(`[diag-call] ${name} propList #${i}/${target.count} obj=${diagObjectDescriptor(value)}`);
-      }
       results.push(callMethod(name, value, ...args));
     }
     return new LingoList(results);
@@ -1837,6 +1967,17 @@ export function offset(needle: LingoValue, haystack: LingoValue): number {
   const h = typeof haystack === "string" ? haystack : String(haystack ?? "");
   const idx = h.indexOf(n);
   return idx >= 0 ? idx + 1 : 0;
+}
+
+export function stringReplace(
+  source: LingoValue,
+  needle: LingoValue,
+  replacement: LingoValue,
+): string {
+  const input = lingoValueToString(source);
+  const search = lingoValueToString(needle);
+  if (search === "") return input;
+  return input.split(search).join(lingoValueToString(replacement));
 }
 
 /** `_try()` / `_catch()` — no-op markers emitted for Lingo `try ... catch` blocks. */
@@ -1948,6 +2089,139 @@ export function randomFloat(): number {
   return Math.random();
 }
 
+export interface BuiltinDispatchResult {
+  handled: boolean;
+  value: LingoValue;
+}
+
+/** Names registered by LibreShockwave's C++ BuiltinRegistry (case-insensitive). */
+export const SUPPORTED_LINGO_BUILTINS = new Set([
+  "abs", "sqrt", "sin", "cos", "random", "integer", "float", "bitand", "bitor",
+  "bitxor", "bitnot", "power", "min", "max", "string", "length", "chars",
+  "chartonum", "numtochar", "offset", "stringreplace", "getpref", "setpref", "put",
+  "alert", "count", "getat", "setat", "addat", "deleteat", "append", "add",
+  "getaprop", "setaprop", "addprop", "deleteprop", "getpropat", "findpos", "getone",
+  "getpos", "deleteone", "sort", "listp", "list", "join", "duplicate",
+  "converttoproplist", "getfirst", "getlast", "timeout", "preloadnetthing",
+  "getnetthing", "getnettext", "postnetthing", "postnettext", "netdone",
+  "nettextresult", "neterror", "getstreamstatus", "tellstreamstatus", "gotonetpage",
+  "gotonetmovie", "externalparamvalue", "externalparamname", "externalparamcount",
+  "image", "importfileinto", "beep", "sound", "soundenabled", "castlib", "member",
+  "field", "createmember", "xtra", "setnetbufferlimits", "setnetmessagehandler",
+  "connecttonetserver", "sendnetmessage", "getnetmessage", "checknetmessages",
+  "getnumberwaitingnetmessages", "getneterrorstring", "return", "halt", "abort",
+  "nothing", "param", "go", "call", "sendallsprites", "point", "rect", "union",
+  "intersect", "color", "rgb", "paletteindex", "sprite", "new", "objectp", "voidp",
+  "value", "script", "ilk", "stringp", "integerp", "floatp", "symbolp", "symbol",
+  "callancestor", "label", "marker", "puppettempo", "puppetsprite", "puppetpalette",
+  "cursor", "setcursor", "pauseupdate", "updatestage", "movetofront", "movetoback",
+  "spritebox",
+]);
+
+/**
+ * Pure/value builtin dispatcher shared by direct generated calls and the host.
+ * Stateful player/network/audio builtins deliberately return `handled: false`.
+ */
+export function dispatchValueBuiltin(
+  name: string,
+  args: LingoValue[],
+): BuiltinDispatchResult {
+  switch (name.toLowerCase()) {
+    case "abs": return { handled: true, value: abs(args[0]) };
+    case "sqrt": return { handled: true, value: sqrt(args[0]) };
+    case "sin": return { handled: true, value: sin(args[0]) };
+    case "cos": return { handled: true, value: cos(args[0]) };
+    case "integer": return { handled: true, value: integer(args[0]) };
+    case "float": return { handled: true, value: float(args[0]) };
+    case "bitand": return { handled: true, value: integer(args[0]) & integer(args[1]) };
+    case "bitor": return { handled: true, value: integer(args[0]) | integer(args[1]) };
+    case "bitxor": return { handled: true, value: integer(args[0]) ^ integer(args[1]) };
+    case "bitnot": return { handled: true, value: ~integer(args[0]) };
+    case "power": return { handled: true, value: power(args[0], args[1]) };
+    case "min": return { handled: true, value: min(...args) };
+    case "max": return { handled: true, value: max(...args) };
+    case "string": return { handled: true, value: string(args[0]) };
+    case "length": return { handled: true, value: length(args[0]) };
+    case "chars": return { handled: true, value: chars(args[0], args[1], args[2] ?? args[1]) };
+    case "chartonum": return { handled: true, value: charToNum(args[0]) };
+    case "numtochar": return { handled: true, value: numToChar(args[0]) };
+    case "offset": return { handled: true, value: offset(args[0], args[1]) };
+    case "stringreplace":
+      return { handled: true, value: stringReplace(args[0], args[1], args[2]) };
+    case "put": put(...args); return { handled: true, value: undefined };
+    case "alert": return { handled: true, value: undefined };
+    case "count": return { handled: true, value: count(args[0]) };
+    case "getat": return { handled: true, value: getAt(args[0], args[1]) };
+    case "setat": setAt(args[0], args[1], args[2]); return { handled: true, value: undefined };
+    case "addat": addAt(args[0], args[1], args[2]); return { handled: true, value: undefined };
+    case "deleteat": deleteAt(args[0], args[1]); return { handled: true, value: undefined };
+    case "append":
+    case "add": append(args[0], args[1]); return { handled: true, value: undefined };
+    case "getaprop": return { handled: true, value: getaProp(args[0], args[1]) };
+    case "setaprop": setaProp(args[0], args[1], args[2]); return { handled: true, value: undefined };
+    case "addprop": addProp(args[0], args[1], args[2]); return { handled: true, value: undefined };
+    case "deleteprop": deleteProp(args[0], args[1]); return { handled: true, value: undefined };
+    case "getpropat": return { handled: true, value: getPropAt(args[0], args[1]) };
+    case "findpos": return { handled: true, value: findPos(args[0], args[1]) };
+    case "getone": return { handled: true, value: getOne(args[0], args[1]) };
+    case "getpos": return { handled: true, value: getPos(args[0], args[1]) };
+    case "deleteone": return { handled: true, value: deleteOne(args[0], args[1]) };
+    case "sort": sort(args[0]); return { handled: true, value: undefined };
+    case "listp": return { handled: true, value: listp(args[0]) };
+    case "list": return { handled: true, value: list(...args) };
+    case "join": return { handled: true, value: join(args[0], args[1] ?? "&") };
+    case "duplicate": return { handled: true, value: duplicate(args[0]) };
+    case "converttoproplist":
+      return { handled: true, value: convertToPropList(args[0], args[1] ?? "\r") };
+    case "getfirst": return { handled: true, value: getFirst(args[0]) };
+    case "getlast": return { handled: true, value: getLast(args[0]) };
+    case "point": return { handled: true, value: new LingoList([float(args[0]), float(args[1])]) };
+    case "rect": return { handled: true, value: rect(args[0], args[1], args[2], args[3]) };
+    case "union": {
+      const a = valueVector(args[0]) ?? [];
+      const b = valueVector(args[1]) ?? [];
+      return {
+        handled: true,
+        value: rect(
+          Math.min(float(a[0]), float(b[0])),
+          Math.min(float(a[1]), float(b[1])),
+          Math.max(float(a[2]), float(b[2])),
+          Math.max(float(a[3]), float(b[3])),
+        ),
+      };
+    }
+    case "intersect": {
+      const a = valueVector(args[0]) ?? [];
+      const b = valueVector(args[1]) ?? [];
+      return {
+        handled: true,
+        value: rect(
+          Math.max(float(a[0]), float(b[0])),
+          Math.max(float(a[1]), float(b[1])),
+          Math.min(float(a[2]), float(b[2])),
+          Math.min(float(a[3]), float(b[3])),
+        ),
+      };
+    }
+    case "color":
+    case "rgb": return { handled: true, value: rgb(args[0], args[1], args[2]) };
+    case "paletteindex": return { handled: true, value: paletteIndex(args[0]) };
+    case "image": return { handled: true, value: image(args[0], args[1], args[2], args[3]) };
+    case "objectp": return { handled: true, value: objectp(args[0]) };
+    case "voidp": return { handled: true, value: voidp(args[0]) };
+    case "stringp": return { handled: true, value: stringp(args[0]) };
+    case "integerp": return { handled: true, value: integerp(args[0]) };
+    case "floatp": return { handled: true, value: floatp(args[0]) };
+    case "symbolp": return { handled: true, value: symbolp(args[0]) };
+    case "symbol": return { handled: true, value: symbol(lingoValueToString(args[0])) };
+    case "value": return { handled: true, value: value(args[0]) };
+    case "script": return { handled: true, value: script(args[0]) };
+    case "ilk": return { handled: true, value: ilk(args[0], args[1]) };
+    case "nothing": return { handled: true, value: undefined };
+    default: return { handled: false, value: undefined };
+  }
+}
+
 // --- Director builtins exposed as direct global calls ----------------------------
 
 /** `castLib(n)` proxy returned by `castLib(n)`. Reads and writes the host's
@@ -1982,10 +2256,19 @@ export class LingoCastLibProxy {
     if (!host) return;
     (host as { setCastlibName?: (n: number, v: string) => void }).setCastlibName?.(this.num, String(value));
   }
+
+  get number(): number { return this.num; }
+  get _number(): number { return this.num; }
 }
 
 /** `castLib(n)` — returns a cast-library token. */
-export function castLib(num: number): LingoCastLibProxy {
+export function castLib(numOrName: LingoValue): LingoCastLibProxy {
+  let num = Number(numOrName);
+  if (!Number.isFinite(num) && typeof numOrName === "string") {
+    const host = getLingoHost();
+    num = (host as { castLibNumberByName?: (name: string) => number } | null)
+      ?.castLibNumberByName?.(numOrName) ?? 0;
+  }
   return new LingoCastLibProxy(num);
 }
 
@@ -2033,9 +2316,19 @@ export function puppetSprite(_channel: LingoValue, _bool?: LingoValue): void {
   // No-op.
 }
 
-/** `setPref(group, key, value)` — no-op in the static runtime. */
-export function setPref(_group: LingoValue, _key: LingoValue, _value: LingoValue): void {
-  // No-op.
+const lingoPreferences = new Map<string, LingoValue>();
+
+/** Director preference storage (`setPref(name,value)` and legacy grouped form). */
+export function setPref(group: LingoValue, key: LingoValue, value?: LingoValue): void {
+  const grouped = value !== undefined;
+  const name = grouped ? `${lingoString(group)}:${lingoString(key)}` : lingoString(group);
+  lingoPreferences.set(name.toLowerCase(), grouped ? value : key);
+}
+
+/** Director preference lookup. Missing preferences are VOID. */
+export function getPref(group: LingoValue, key?: LingoValue): LingoValue {
+  const name = key === undefined ? lingoString(group) : `${lingoString(group)}:${lingoString(key)}`;
+  return lingoPreferences.get(name.toLowerCase());
 }
 
 /** `moveToFront(obj)` / `moveFront(obj)` — no-op sprite-order helpers. */
@@ -2107,6 +2400,57 @@ export function string(value: LingoValue): string {
 }
 
 /** `value(expr)` — parse a Lingo literal from a string. */
+function splitTopLevel(text: string, delimiter: string): string[] {
+  const parts: string[] = [];
+  let start = 0;
+  let squareDepth = 0;
+  let parenDepth = 0;
+  let quoted = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i]!;
+    if (ch === '"') {
+      if (quoted && text[i + 1] === '"') {
+        i += 1;
+      } else {
+        quoted = !quoted;
+      }
+      continue;
+    }
+    if (quoted) continue;
+    if (ch === "[") squareDepth += 1;
+    else if (ch === "]") squareDepth -= 1;
+    else if (ch === "(") parenDepth += 1;
+    else if (ch === ")") parenDepth -= 1;
+    else if (ch === delimiter && squareDepth === 0 && parenDepth === 0) {
+      parts.push(text.slice(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(text.slice(start));
+  return parts;
+}
+
+function topLevelColon(text: string): number {
+  let squareDepth = 0;
+  let parenDepth = 0;
+  let quoted = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i]!;
+    if (ch === '"') {
+      if (quoted && text[i + 1] === '"') i += 1;
+      else quoted = !quoted;
+      continue;
+    }
+    if (quoted) continue;
+    if (ch === "[") squareDepth += 1;
+    else if (ch === "]") squareDepth -= 1;
+    else if (ch === "(") parenDepth += 1;
+    else if (ch === ")") parenDepth -= 1;
+    else if (ch === ":" && squareDepth === 0 && parenDepth === 0) return i;
+  }
+  return -1;
+}
+
 export function value(expr: LingoValue): LingoValue {
   if (typeof expr !== "string") {
     return expr;
@@ -2120,27 +2464,35 @@ export function value(expr: LingoValue): LingoValue {
   if (Number.isFinite(num) && !/^0x/i.test(s)) {
     return num;
   }
-  // Symbol literal #foo.
-  if (s.startsWith("#")) {
-    return symbol(s.slice(1));
+  if (s.startsWith('"') && s.endsWith('"') && s.length >= 2) {
+    return s.slice(1, -1).replace(/""/g, '"');
   }
-  // List literal [a, b, c] — best-effort comma split, with quoted string items.
+  if (/^rgb\s*\(/i.test(s)) {
+    return parseColorTriple(s);
+  }
+  // Director uses the same brackets for lists and property lists. A top-level
+  // colon distinguishes `[#key: value]` from `[value, value]`.
   if (s.startsWith("[") && s.endsWith("]")) {
     const inner = s.slice(1, -1).trim();
     if (inner === "") {
       return new LingoList();
     }
-    const items: LingoValue[] = [];
-    for (const part of inner.split(",")) {
-      const trimmed = part.trim();
-      if (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2) {
-        // Lingo quoted string: strip outer quotes and unescape doubled quotes.
-        items.push(trimmed.slice(1, -1).replace(/""/g, '"'));
-      } else {
-        items.push(value(trimmed));
+    const parts = splitTopLevel(inner, ",");
+    if (parts.some((part) => topLevelColon(part) >= 0)) {
+      const props = new LingoPropList();
+      for (const part of parts) {
+        const colon = topLevelColon(part);
+        if (colon < 0) continue;
+        const key = value(part.slice(0, colon).trim());
+        props.add(key, value(part.slice(colon + 1).trim()));
       }
+      return props;
     }
-    return new LingoList(items);
+    return new LingoList(parts.map((part) => value(part.trim())));
+  }
+  // Symbol literal #foo.
+  if (s.startsWith("#")) {
+    return symbol(s.slice(1));
   }
   // PropList literal [:a:1, ...] — delegate to the property parser.
   if (s.startsWith("[:") || s.includes(":")) {
