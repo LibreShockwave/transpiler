@@ -41,6 +41,21 @@ export type LingoValue =
   | LingoMe
   | { readonly id: number | string; readonly castLib?: number | string };
 
+/** Internal sentinel stored in a LingoMe property map to mark a declared property
+ *  whose value is VOID.  The sentinel distinguishes "declared but VOID" (shadows
+ *  ancestors) from "never declared" (falls back to ancestors).
+ */
+export const LINGO_VOID_SENTINEL = Symbol("LINGO_VOID");
+
+/**
+ * The canonical runtime value for Lingo VOID.  It is returned for missing
+ * propList keys and for declared-but-VOID properties, so emitted code can do
+ * things like `pFontData[#fontStyle].item.count` without crashing on a bare
+ * JavaScript `undefined`.  Its `Symbol.toPrimitive` returns `undefined`, so
+ * `voidp`, `lingoTruthy`, and loose equality (`==`) still behave like VOID.
+ */
+export let LINGO_VOID: LingoValue;
+
 // Director lists are 1-indexed: index 1 is the first element, index 0 and out-of-range access
 // are runtime errors (matching Lingo's "index out of range"). This is the container the emitted
 // handlers and the future executor use for `[...]` literals and `list(...)` / `add` calls.
@@ -317,6 +332,13 @@ export class LingoPropList {
             }
           };
         }
+        // JavaScript's built-in string/number coercion reaches these well-known
+        // symbols.  Without an explicit function the proxy would return LINGO_VOID
+        // for missing keys, which V8 then tries to call as a primitive converter
+        // and throws "object is not a function".
+        if (prop === Symbol.toPrimitive || prop === "toString" || prop === "valueOf") {
+          return () => undefined;
+        }
         // Numeric indexing — Lingo treats pList[i] as the i-th value (1-based, like
         // LingoList). Director's propList supports both key lookup and index lookup;
         // the transpiler emits `pActiveTasks[i]` for the "i-th entry" form.
@@ -335,9 +357,11 @@ export class LingoPropList {
             return target.keys.length;
           }
           const stored = target.get(key);
-          if (stored !== undefined) {
-            return stored;
+          const member = (target as unknown as Record<string, unknown>)[prop as string];
+          if (typeof member === "function") {
+            return (member as (...a: unknown[]) => unknown).bind(target);
           }
+          return stored;
         }
         const member = (target as unknown as Record<string, unknown>)[prop as string];
         if (typeof member === "function") {
@@ -408,6 +432,10 @@ export class LingoPropList {
     if (k === undefined) {
       return;
     }
+    if (value === undefined || value === LINGO_VOID) {
+      this.deleteProp(key);
+      return;
+    }
     const i = this.findKeyIndex(key);
     if (i >= 0) {
       this.vals[i] = value;
@@ -425,9 +453,10 @@ export class LingoPropList {
   get(key: LingoValue): LingoValue {
     const i = this.findKeyIndex(key);
     if (i < 0) {
-      return undefined;
+      return LINGO_VOID;
     }
-    return this.vals[i] as LingoValue;
+    const v = this.vals[i] as LingoValue;
+    return v === undefined ? LINGO_VOID : v;
   }
 
   getaProp(key: LingoValue): LingoValue {
@@ -436,6 +465,16 @@ export class LingoPropList {
 
   setaProp(key: LingoValue, value: LingoValue): void {
     this.add(key, value);
+  }
+
+  /** Alias for `setaProp`; emitted Lingo uses both names interchangeably. */
+  setProp(key: LingoValue, value: LingoValue): void {
+    this.add(key, value);
+  }
+
+  /** Alias for `getaProp`; emitted Lingo uses both names interchangeably. */
+  getProp(key: LingoValue): LingoValue {
+    return this.get(key);
   }
 
   deleteProp(key: LingoValue): void {
@@ -602,7 +641,7 @@ export function bitXor(a: LingoValue, b: LingoValue): number {
 
 // String(x) in Lingo: VOID -> "VOID", TRUE/FALSE capitalized, lists bracketed.
 export function lingoString(value: LingoValue): string {
-  if (value === undefined) {
+  if (value === LINGO_VOID || value === undefined) {
     return "VOID";
   }
   if (typeof value === "boolean") {
@@ -643,6 +682,16 @@ export interface LingoHost {
   getMember(numOrName: LingoValue, castLib?: LingoValue): LingoValue;
   /** Return the full list of exported cast members (used to resolve numeric script references). */
   getCastMembers(): { id: number; castLib: number; name?: string; type?: string }[];
+  /**
+   * Resolve a `script("...")` or `script(n)` argument to the script member's
+   * identity (name, owning cast library, and local member id). This mirrors
+   * Director's script builtin semantics: numeric ids <= 65535 refer to castlib 1,
+   * larger ids are decoded as `(castLib << 16) | member`, and string/symbol
+   * names resolve across registered castlibs.
+   */
+  getScriptMemberInfo(
+    nameOrNum: LingoValue,
+  ): { name: string; castLib: number; memberId: number; type?: string } | undefined;
   /** Read a property of a member token returned by getMember. */
   getMemberProp(member: LingoValue, prop: string): LingoValue;
   /** Write a property of a member token. */
@@ -952,25 +1001,42 @@ export function createMe(spriteNum: number): LingoMe {
 export function meProp(me: LingoMe, name: LingoValue): LingoValue {
   const key = lingoKeyToString(name);
   if (key === undefined) {
-    return undefined;
+    return LINGO_VOID;
   }
   let cur: LingoValue = me;
   while (cur && typeof cur === "object" && "props" in cur) {
     const props: Map<string, LingoValue> = (cur as { props: Map<string, LingoValue> }).props;
     if (props.has(key)) {
-      return props.get(key);
+      const value = props.get(key);
+      return value === undefined || (value as unknown) === LINGO_VOID_SENTINEL
+        ? LINGO_VOID
+        : value;
     }
     cur = props.get("ancestor");
+    if (cur === undefined || (cur as unknown) === LINGO_VOID_SENTINEL) {
+      cur = undefined;
+    }
   }
-  me.props.set(key, undefined);
-  return undefined;
+  me.props.set(key, LINGO_VOID_SENTINEL as unknown as LingoValue);
+  return LINGO_VOID;
 }
 
 export function setMeProp(me: LingoMe, name: LingoValue, value: LingoValue): void {
   const key = lingoKeyToString(name);
-  if (key !== undefined) {
-    me.props.set(key, value);
+  if (key === undefined) {
+    return;
   }
+  if (value === undefined || value === LINGO_VOID) {
+    // VOID assignment deletes the property so ancestor fallback resumes.  The
+    // special `ancestor` property is preserved: it is the behavior-composition
+    // link and must not be torn down by a VOID assignment (see LingoRuntimeHost
+    // createMe Proxy set handler for the full rationale).
+    if (key !== "ancestor") {
+      me.props.delete(key);
+    }
+    return;
+  }
+  me.props.set(key, value);
 }
 
 /**
@@ -1234,18 +1300,15 @@ export function newObj(type: string, args: LingoValue): LingoValue {
 
 /** `script("ClassName")` or `script(memberNum)` — returns the instance-creation token used by `new(...)`. */
 export function script(nameOrNum: LingoValue): string {
-  let resolved: string;
-  if (typeof nameOrNum === "number") {
-    try {
-      // Numeric member ids are only unique within a cast. `getmemnum(name)`
-      // leaves an explicit cast hint in the host; resolving through member()
-      // consumes that hint and avoids selecting the first same-numbered script
-      // from an unrelated cast library.
-      resolved = member(nameOrNum).name;
-    } catch {
-      resolved = String(nameOrNum);
+  const host = getLingoHost();
+  if (host) {
+    const info = host.getScriptMemberInfo(nameOrNum);
+    if (info) {
+      return `script("${info.name}"),${info.castLib},${info.memberId}`;
     }
-  } else if (isSymbol(nameOrNum)) {
+  }
+  let resolved: string;
+  if (isSymbol(nameOrNum)) {
     resolved = nameOrNum.name;
   } else if (typeof nameOrNum === "string") {
     resolved = nameOrNum;
@@ -1280,8 +1343,8 @@ export function lingoBinary(
   const op = operator.toLowerCase();
   if (op === "contains") return contains(left, right);
   if (op === "starts") return starts(left, right);
-  if (op === "join") return lingoValueToString(left) + lingoValueToString(right);
-  if (op === "joinpad") return lingoValueToString(left) + " " + lingoValueToString(right);
+  if (op === "join") return joinString(left) + joinString(right);
+  if (op === "joinpad") return joinString(left) + " " + joinString(right);
   if (op === "and") return lingoTruthy(left) && lingoTruthy(right);
   if (op === "or") return lingoTruthy(left) || lingoTruthy(right);
   if (op === "eq" || op === "neq") {
@@ -1317,7 +1380,7 @@ export function lingoBinary(
 }
 
 export function lingoTruthy(value: LingoValue): boolean {
-  if (value === undefined || value === null || value === false) return false;
+  if (value == null || value === false) return false;
   if (typeof value === "number") return value !== 0;
   if (typeof value === "string") return value.length > 0;
   return true;
@@ -1357,6 +1420,17 @@ function lingoValueToString(value: LingoValue): string {
 
 /** Alias used by the host when a Lingo value needs to be forced to a string. */
 export function _string(value: LingoValue): string {
+  return lingoValueToString(value);
+}
+
+/** String conversion used by `&` / `&&` (`join` / `joinPad`).
+ *  In Director, symbols concatenate as their bare name (`"x" & #foo` => `"xfoo"`),
+ *  not as their printed form `"#foo"`.
+ */
+function joinString(value: LingoValue): string {
+  if (isSymbol(value)) {
+    return value.name;
+  }
   return lingoValueToString(value);
 }
 
@@ -1451,6 +1525,42 @@ function joinChunks(parts: string[], type: string): string {
       return parts.join("");
   }
 }
+
+const VOID_CHUNK_CACHE: Record<string, unknown> = {};
+
+function voidChunk(type: string): unknown {
+  const key = chunkTypeName(type);
+  if (!VOID_CHUNK_CACHE[key]) {
+    VOID_CHUNK_CACHE[key] = makeStringChunkList("", key);
+  }
+  return VOID_CHUNK_CACHE[key];
+}
+
+LINGO_VOID = new Proxy(Object.create(null), {
+  get(_target, prop) {
+    if (prop === Symbol.toPrimitive || prop === "toString" || prop === "valueOf") {
+      return () => undefined;
+    }
+    if (prop === "ilk") {
+      return symbol("void");
+    }
+    if (prop === "length" || prop === "count") {
+      return 0;
+    }
+    const p = typeof prop === "string" ? prop : String(prop);
+    const lower = p.toLowerCase();
+    if (lower === "item" || lower === "char" || lower === "word" || lower === "line") {
+      return voidChunk(lower);
+    }
+    return undefined;
+  },
+  has() {
+    return false;
+  },
+  ownKeys() {
+    return [];
+  },
+}) as unknown as LingoValue;
 
 /** `char 1 of s`, `item 2 to 4 of s`, `line figure of field f`, etc. */
 export function chunkOf(
@@ -1622,7 +1732,7 @@ export const _symbol = symbol;
 // --- Common Lingo utility builtins (stubs that keep handlers running) ----------
 
 export function voidp(value: LingoValue): boolean {
-  return value === undefined || value === null;
+  return value == null || value === LINGO_VOID;
 }
 
 export function listp(value: LingoValue): boolean {
@@ -2487,7 +2597,7 @@ export function postNetText(_url: LingoValue, _data: LingoValue): LingoValue {
 
 /** `objectp(value)` — true for script instances / objects. */
 export function objectp(value: LingoValue): boolean {
-  if (value === null || value === undefined) {
+  if (value === null || value === undefined || value === LINGO_VOID) {
     return false;
   }
   if (typeof value !== "object") {

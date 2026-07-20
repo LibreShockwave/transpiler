@@ -193,6 +193,7 @@ describe("LingoHost wiring", () => {
       setSpriteProp: (_channel, prop, value) => { props[prop] = value; },
       getMember: () => undefined,
       getCastMembers: () => [],
+      getScriptMemberInfo: () => undefined,
       getMemberProp: () => undefined,
       setMemberProp: () => undefined,
       getGlobal: () => undefined,

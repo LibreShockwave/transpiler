@@ -192,9 +192,36 @@ void (async () => {
     ]),
   );
 
-  const resolveScriptToken = (token: string): string | null => {
-    const match = token.match(/^script\("(.+)"\)$/);
-    return match?.[1] ?? null;
+  interface ScriptToken {
+    name: string;
+    castLib?: number;
+    castMember?: number;
+  }
+  const parseScriptToken = (token: string): ScriptToken | null => {
+    const match = token.match(/^script\("([^"]+)"\)(?:,(\d+),(\d+))?$/);
+    if (!match) return null;
+    return {
+      name: match[1],
+      castLib: match[2] ? Number(match[2]) : undefined,
+      castMember: match[3] ? Number(match[3]) : undefined,
+    };
+  };
+  const resolveScriptModule = (token: ScriptToken): ScriptModule | undefined => {
+    if (token.castLib !== undefined && token.castMember !== undefined) {
+      const exact = scriptsByCastMember.get(`${token.castLib}:${token.castMember}`);
+      if (exact) return exact;
+    }
+    return scriptsByName.get(token.name);
+  };
+  const resolveLayerModule = (layer: runtime.LingoMe): ScriptModule | undefined => {
+    const name = String(layer.props.get("__scriptName") ?? "");
+    const castLib = Number(layer.props.get("__scriptCastLib") ?? 0);
+    const castMember = Number(layer.props.get("__scriptCastMember") ?? 0);
+    if (castLib > 0 && castMember > 0) {
+      const exact = scriptsByCastMember.get(`${castLib}:${castMember}`);
+      if (exact) return exact;
+    }
+    return scriptsByName.get(name);
   };
   const parentInstances = new Set<runtime.LingoMe>();
   const invokeInstance = (
@@ -205,6 +232,10 @@ void (async () => {
   ): runtime.LingoValue => {
     const implementation = module.lsHandlerStubs[handlerName];
     if (!implementation) return undefined;
+    if (["Execute", "register", "executeMessage", "updateState", "showHotel", "showEntryBar", "hideAll", "construct", "initAll", "initThread", "buildThreadObj"].includes(handlerName)) {
+      // eslint-disable-next-line no-console
+      console.log("[invoke]", module.lsScriptName, handlerName, args.map((a) => String(a)).join(","));
+    }
     host.pushParams(args);
     host.pushCastLib(module.lsCastLib);
     try {
@@ -216,12 +247,14 @@ void (async () => {
   };
 
   host.setScriptInstanceCreator((token, args) => {
-    const scriptName = resolveScriptToken(token);
-    if (!scriptName) return undefined;
-    const module = scriptsByName.get(scriptName);
+    const parsed = parseScriptToken(token);
+    if (!parsed) return undefined;
+    const module = resolveScriptModule(parsed);
     if (!module) return undefined;
     const me = host.createMe(0);
-    me.props.set("__scriptName", scriptName);
+    me.props.set("__scriptName", module.lsScriptName);
+    me.props.set("__scriptCastLib", module.lsCastLib);
+    me.props.set("__scriptCastMember", module.lsCastMember);
     runtime.seedScriptProps(me, module.lsLingoSource);
     parentInstances.add(me);
     if (module.lsHandlers.some((handler) => handler.name === "_new")) {
@@ -229,15 +262,14 @@ void (async () => {
     }
     return me;
   });
-  host.setInstanceDispatcher((scriptName, handlerName, me, args) => {
+  host.setInstanceDispatcher((_scriptName, handlerName, me, args) => {
     let current: runtime.LingoValue = me;
     const visited = new Set<runtime.LingoMe>();
     while (current && typeof current === "object" && "props" in current) {
       const layer = current as runtime.LingoMe;
       if (visited.has(layer)) break;
       visited.add(layer);
-      const layerScriptName = String(layer.props.get("__scriptName") ?? scriptName);
-      const module = scriptsByName.get(layerScriptName);
+      const module = resolveLayerModule(layer);
       const handler = module?.lsHandlers.find(
         (candidate) => candidate.name.toLowerCase() === handlerName.toLowerCase(),
       );
@@ -250,11 +282,12 @@ void (async () => {
     }
     return undefined;
   });
-  host.setInstanceHandlerChecker((scriptName, handlerName) =>
-    scriptsByName.get(scriptName)?.lsHandlers.some(
+  host.setInstanceHandlerChecker((instance, handlerName) => {
+    const module = resolveLayerModule(instance);
+    return module?.lsHandlers.some(
       (handler) => handler.name.toLowerCase() === handlerName.toLowerCase(),
-    ) ?? false
-  );
+    ) ?? false;
+  });
 
   const behaviorInstances = new Map<string, runtime.LingoMe>();
   const movieInstances = new Map<string, runtime.LingoMe>();
@@ -272,6 +305,8 @@ void (async () => {
     if (!me) {
       me = host.createMe(spriteNum);
       me.props.set("__scriptName", module.lsScriptName);
+      me.props.set("__scriptCastLib", module.lsCastLib);
+      me.props.set("__scriptCastMember", module.lsCastMember);
       runtime.seedScriptProps(me, module.lsLingoSource);
       cache.set(key, me);
     }
@@ -304,8 +339,7 @@ void (async () => {
     // Parent-script frame handlers (most importantly Object Manager's
     // prepareFrame pump) therefore receive the normal movie event cycle.
     for (const me of [...parentInstances]) {
-      const scriptName = String(me.props.get("__scriptName") ?? "");
-      const module = scriptsByName.get(scriptName);
+      const module = resolveLayerModule(me);
       if (module) dispatchModuleEvent(module, event, me);
     }
   };

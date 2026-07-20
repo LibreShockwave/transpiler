@@ -32,33 +32,41 @@ function resolveUrl(url: LingoValue): string {
 export function getNetText(url: LingoValue): number {
   const id = nextNetId++;
   const fullUrl = resolveUrl(url);
+  const result = { done: 0, error: "OK", text: "" };
+  netResults.set(id, result);
   try {
     const xhr = new XMLHttpRequest();
-    xhr.open("GET", fullUrl, false);
-    xhr.send();
-    if (xhr.status >= 200 && xhr.status < 300) {
-      const result = { done: 0, error: "OK", text: xhr.responseText };
-      netResults.set(id, result);
-      globalThis.setTimeout(() => {
-        result.done = 1;
-      }, 0);
-    } else {
-      const result = { done: 0, error: String(xhr.status), text: "" };
-      netResults.set(id, result);
-      globalThis.setTimeout(() => {
-        result.done = 1;
-      }, 0);
-    }
-    // eslint-disable-next-line no-console
-    console.warn(`[diag-net] getNetText id=${id} url=${fullUrl} status=${xhr.status} len=${xhr.responseText.length}`);
-  } catch (e) {
-    const result = { done: 0, error: String(e), text: "" };
-    netResults.set(id, result);
-    globalThis.setTimeout(() => {
+    xhr.open("GET", fullUrl, true);
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        result.text = xhr.responseText;
+        result.error = "OK";
+      } else {
+        result.text = "";
+        result.error = String(xhr.status);
+      }
       result.done = 1;
-    }, 0);
-    // eslint-disable-next-line no-console
-    console.warn(`[diag-net] getNetText id=${id} url=${fullUrl} error=${String(e)}`);
+    };
+    xhr.onerror = () => {
+      result.text = "";
+      result.error = "network error";
+      result.done = 1;
+    };
+    xhr.onabort = () => {
+      result.text = "";
+      result.error = "aborted";
+      result.done = 1;
+    };
+    xhr.ontimeout = () => {
+      result.text = "";
+      result.error = "timeout";
+      result.done = 1;
+    };
+    xhr.send();
+  } catch (e) {
+    result.text = "";
+    result.error = String(e);
+    result.done = 1;
   }
   return id;
 }
@@ -126,32 +134,39 @@ export function preloadNetThing(url: LingoValue): number {
   // DoneCurrentDownLoad — a stub that pre-marks the entry as done with empty text
   // would cause the castload loop to spin through all 8 retries without ever
   // issuing a real download.
-  netResults.set(id, { done: 0, error: "OK", text: "" });
-  try {
-    const xhr = new XMLHttpRequest();
-    xhr.open("GET", fullUrl, false);
-    xhr.send();
-    const r = netResults.get(id);
-    if (!r) return id;
+  const result = { done: 0, error: "OK", text: "" };
+  netResults.set(id, result);
+  const xhr = new XMLHttpRequest();
+  xhr.open("GET", fullUrl, true);
+  xhr.onload = () => {
     const contentType = xhr.getResponseHeader("content-type")?.toLowerCase() ?? "";
     const unexpectedHtml = requestedFileName(fullUrl).endsWith(".cct")
       && (contentType.includes("text/html") || /^\s*<!doctype html/i.test(xhr.responseText));
     if (xhr.status >= 200 && xhr.status < 300 && !unexpectedHtml) {
-      r.text = xhr.responseText;
-      r.error = "OK";
+      result.text = xhr.responseText;
+      result.error = "OK";
     } else {
-      r.text = "";
-      r.error = unexpectedHtml ? "4149" : String(xhr.status);
+      result.text = "";
+      result.error = unexpectedHtml ? "4149" : String(xhr.status);
     }
-    r.done = 1;
-  } catch (e) {
-    const r = netResults.get(id);
-    if (r) {
-      r.text = "";
-      r.error = String(e);
-      r.done = 1;
-    }
-  }
+    result.done = 1;
+  };
+  xhr.onerror = () => {
+    result.text = "";
+    result.error = "network error";
+    result.done = 1;
+  };
+  xhr.onabort = () => {
+    result.text = "";
+    result.error = "aborted";
+    result.done = 1;
+  };
+  xhr.ontimeout = () => {
+    result.text = "";
+    result.error = "timeout";
+    result.done = 1;
+  };
+  xhr.send();
   return id;
 }
 
