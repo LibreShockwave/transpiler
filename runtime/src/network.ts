@@ -37,14 +37,26 @@ export function getNetText(url: LingoValue): number {
     xhr.open("GET", fullUrl, false);
     xhr.send();
     if (xhr.status >= 200 && xhr.status < 300) {
-      netResults.set(id, { done: 1, error: "OK", text: xhr.responseText });
+      const result = { done: 0, error: "OK", text: xhr.responseText };
+      netResults.set(id, result);
+      globalThis.setTimeout(() => {
+        result.done = 1;
+      }, 0);
     } else {
-      netResults.set(id, { done: 1, error: String(xhr.status), text: "" });
+      const result = { done: 0, error: String(xhr.status), text: "" };
+      netResults.set(id, result);
+      globalThis.setTimeout(() => {
+        result.done = 1;
+      }, 0);
     }
     // eslint-disable-next-line no-console
     console.warn(`[diag-net] getNetText id=${id} url=${fullUrl} status=${xhr.status} len=${xhr.responseText.length}`);
   } catch (e) {
-    netResults.set(id, { done: 1, error: String(e), text: "" });
+    const result = { done: 0, error: String(e), text: "" };
+    netResults.set(id, result);
+    globalThis.setTimeout(() => {
+      result.done = 1;
+    }, 0);
     // eslint-disable-next-line no-console
     console.warn(`[diag-net] getNetText id=${id} url=${fullUrl} error=${String(e)}`);
   }
@@ -98,7 +110,14 @@ export function preloadNetThing(url: LingoValue): number {
   if (preloadedCastFiles.has(requestedFileName(fullUrl))) {
     // The exporter has already parsed this cast and emitted it as TypeScript. Director's
     // castload state machine still requires a completed stream with non-zero byte counts.
-    netResults.set(id, { done: 1, error: "OK", text: "\0" });
+    // Completion is asynchronous even when the bytes are already cached: reporting done
+    // in the initiating call stack can re-enter constructors before their owners publish
+    // the newly created instance.
+    const result = { done: 0, error: "OK", text: "\0" };
+    netResults.set(id, result);
+    globalThis.setTimeout(() => {
+      result.done = 1;
+    }, 0);
     return id;
   }
   // Pre-mark the entry as not-done so callers polling netDone(id) see 0 until the

@@ -12,6 +12,8 @@
 // No TS Lingo bytecode VM is built (out of scope, see GOAL.md): handlers are emitted as readable
 // TS source backed by this shim, not interpreted.
 
+import { Bitmap } from "./Bitmap.js";
+
 /** Thrown by emitted handler stubs and by accessors whose execution wiring has not landed. */
 export class LingoNotImplemented extends Error {
   constructor(message: string) {
@@ -115,6 +117,18 @@ export class LingoList {
         if (typeof prop === "symbol") {
           return false;
         }
+        if (typeof prop === "string") {
+          const coordinateIndex: Record<string, number> = {
+            loch: 1, x: 1, left: 1,
+            locv: 2, y: 2, top: 2,
+            right: 3, bottom: 4,
+          };
+          const index = coordinateIndex[prop.toLowerCase()];
+          if (index !== undefined) {
+            target.set(index, value as LingoValue);
+            return true;
+          }
+        }
         const num = Number(prop);
         if (Number.isInteger(num) && num >= 1) {
           target.set(num, value as LingoValue);
@@ -132,6 +146,18 @@ export class LingoList {
   get count(): number {
     return this.items.length;
   }
+
+  /** Director point/list coordinate aliases used by text metrics. */
+  get locH(): number { return Number(this.items[0]) || 0; }
+  get locV(): number { return Number(this.items[1]) || 0; }
+  get x(): number { return this.locH; }
+  get y(): number { return this.locV; }
+  get left(): number { return Number(this.items[0]) || 0; }
+  get top(): number { return Number(this.items[1]) || 0; }
+  get right(): number { return Number(this.items[2]) || 0; }
+  get bottom(): number { return Number(this.items[3]) || 0; }
+  get width(): number { return this.items.length >= 4 ? this.right - this.left : 0; }
+  get height(): number { return this.items.length >= 4 ? this.bottom - this.top : 0; }
 
   get(index: number): LingoValue {
     if (!Number.isInteger(index) || index < 1 || index > this.items.length) {
@@ -358,12 +384,22 @@ export class LingoPropList {
     if (i >= 0) {
       return i;
     }
-    if (isSymbol(key) && k.startsWith("#")) {
+    if (k.startsWith("#")) {
       i = this.keys.indexOf(k.slice(1));
       if (i >= 0) {
         return i;
       }
+    } else {
+      i = this.keys.indexOf(`#${k}`);
+      if (i >= 0) {
+        return i;
+      }
     }
+    const canonical = k.replace(/^#/, "").toLowerCase();
+    i = this.keys.findIndex((candidate) =>
+      candidate.replace(/^#/, "").toLowerCase() === canonical
+    );
+    if (i >= 0) return i;
     return -1;
   }
 
@@ -372,7 +408,7 @@ export class LingoPropList {
     if (k === undefined) {
       return;
     }
-    const i = this.keys.indexOf(k);
+    const i = this.findKeyIndex(key);
     if (i >= 0) {
       this.vals[i] = value;
       return;
@@ -417,9 +453,9 @@ export class LingoPropList {
     return this.keys[index - 1];
   }
 
-  findPos(key: LingoValue): number {
+  findPos(key: LingoValue): number | undefined {
     const i = this.findKeyIndex(key);
-    return i >= 0 ? i + 1 : 0;
+    return i >= 0 ? i + 1 : undefined;
   }
 
   has(key: LingoValue): boolean {
@@ -663,6 +699,9 @@ export class LingoSpriteProxy {
     public readonly num: number,
     public readonly host: LingoHost,
   ) {}
+
+  /** Director's channel-number property (`sprite(n).spriteNum`). */
+  get spriteNum(): number { return this.num; }
 
   private getNum(name: string): number {
     return float(this.host.getSpriteProp(this.num, name));
@@ -1856,14 +1895,17 @@ export function rect(
 /** Minimal mutable Director image value used by dynamically-built UI buffers. */
 export class LingoImage {
   public paletteRef: LingoValue;
+  public readonly bitmap: Bitmap;
 
   constructor(
     public width: number,
     public height: number,
     public depth: number,
     paletteRef?: LingoValue,
+    bitmap?: Bitmap,
   ) {
     this.paletteRef = paletteRef;
+    this.bitmap = bitmap ?? new Bitmap(width, height, depth);
   }
 
   get rect(): LingoList {
@@ -1871,13 +1913,79 @@ export class LingoImage {
   }
 
   duplicate(): LingoImage {
-    return new LingoImage(this.width, this.height, this.depth, this.paletteRef);
+    return new LingoImage(this.width, this.height, this.depth, this.paletteRef, this.bitmap.copy());
   }
 
-  setPixel(_x: LingoValue, _y: LingoValue, _color: LingoValue): void {}
-  copyPixels(..._args: LingoValue[]): void {}
+  setPixel(x: LingoValue, y: LingoValue, color: LingoValue): void {
+    const px = integer(x);
+    const py = integer(y);
+    if (px < 0 || py < 0 || px >= this.width || py >= this.height) return;
+    this.bitmap.pixels()[py * this.width + px] = imageColor(color);
+    this.bitmap.markScriptModified();
+  }
+
+  fill(...args: LingoValue[]): void {
+    const rectangle = imageRectValues(args[0]);
+    const left = rectangle ? rectangle[0] : args[0];
+    const top = rectangle ? rectangle[1] : args[1];
+    const right = rectangle ? rectangle[2] : args[2];
+    const bottom = rectangle ? rectangle[3] : args[3];
+    const color = rectangle ? args[1] : args[4];
+    const l = Math.max(0, integer(left));
+    const t = Math.max(0, integer(top));
+    const r = Math.min(this.width, integer(right));
+    const b = Math.min(this.height, integer(bottom));
+    const pixel = imageColor(color);
+    const pixels = this.bitmap.pixels();
+    for (let y = t; y < b; y += 1) {
+      pixels.fill(pixel, y * this.width + l, y * this.width + r);
+    }
+    this.bitmap.markScriptModified();
+  }
+
+  copyPixels(source: LingoValue, destinationRect: LingoValue, sourceRect: LingoValue, _options?: LingoValue): void {
+    if (!(source instanceof LingoImage)) return;
+    const dst = imageRectValues(destinationRect);
+    const src = imageRectValues(sourceRect);
+    if (!dst || !src) return;
+    const dstWidth = Math.max(0, integer(dst[2]) - integer(dst[0]));
+    const dstHeight = Math.max(0, integer(dst[3]) - integer(dst[1]));
+    const srcWidth = Math.max(0, integer(src[2]) - integer(src[0]));
+    const srcHeight = Math.max(0, integer(src[3]) - integer(src[1]));
+    if (dstWidth === 0 || dstHeight === 0 || srcWidth === 0 || srcHeight === 0) return;
+    const from = source.bitmap.pixels();
+    const to = this.bitmap.pixels();
+    for (let dy = 0; dy < dstHeight; dy += 1) {
+      const ty = integer(dst[1]) + dy;
+      const sy = integer(src[1]) + Math.floor(dy * srcHeight / dstHeight);
+      if (ty < 0 || ty >= this.height || sy < 0 || sy >= source.height) continue;
+      for (let dx = 0; dx < dstWidth; dx += 1) {
+        const tx = integer(dst[0]) + dx;
+        const sx = integer(src[0]) + Math.floor(dx * srcWidth / dstWidth);
+        if (tx < 0 || tx >= this.width || sx < 0 || sx >= source.width) continue;
+        to[ty * this.width + tx] = from[sy * source.width + sx];
+      }
+    }
+    this.bitmap.markScriptModified();
+  }
   draw(..._args: LingoValue[]): void {}
+  createMatte(): LingoImage { return this.duplicate(); }
   trimWhiteSpace(): LingoImage { return this; }
+}
+
+function imageRectValues(value: LingoValue): LingoValue[] | undefined {
+  if (value instanceof LingoList) return value.toArray();
+  if (Array.isArray(value)) return value;
+  return undefined;
+}
+
+function imageColor(value: LingoValue): number {
+  if (typeof value === "number") return (0xff000000 | (value & 0x00ffffff)) >>> 0;
+  if (value && typeof value === "object" && "red" in value && "green" in value && "blue" in value) {
+    const color = value as unknown as { red: number; green: number; blue: number };
+    return (0xff000000 | ((color.red & 0xff) << 16) | ((color.green & 0xff) << 8) | (color.blue & 0xff)) >>> 0;
+  }
+  return 0xff000000;
 }
 
 /** `image(width, height, depth[, palette])`. */

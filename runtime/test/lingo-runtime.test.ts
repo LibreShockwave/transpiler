@@ -104,6 +104,12 @@ describe("LingoPropList", () => {
     expect(p.getLast()).toBe(20);
   });
 
+  it("returns VOID from findPos when a property is absent", () => {
+    const p = new LingoPropList(["first", 10]);
+    expect(p.findPos("first")).toBe(1);
+    expect(p.findPos("missing")).toBeUndefined();
+  });
+
   it("iterates values in insertion order", () => {
     const p = new LingoPropList(["first", 1, "second", 2]);
     expect(p.toArray()).toEqual([1, 2]);

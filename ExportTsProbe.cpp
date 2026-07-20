@@ -2167,6 +2167,13 @@ int main(int argc, char** argv) {
                 }
                 ts << "];\n";
 
+                // A pre-play snapshot holds CastLib shared pointers; player.play()
+                // can unload their members before this loop. Do not publish the
+                // resulting empty placeholder record—the directory walk below
+                // will emit the real file instead.
+                if (rec.memberCount == 0) {
+                    continue;
+                }
                 const fs::path castlibPath = options.outDir / rel;
                 std::ofstream out(castlibPath, std::ios::trunc);
                 if (!out) {
@@ -2210,7 +2217,21 @@ int main(int argc, char** argv) {
         // registry has a unique key for each .cct.
         constexpr int SYNTHETIC_CASTLIB_BASE = 200;
         std::unordered_set<std::string> coveredStems;
+        std::unordered_map<std::string, int> namedPhysicalSlots;
+        int highestPhysicalSlot = 0;
+        for (const auto& [castLibNum, castLib] : player.castLibManager().castLibs()) {
+            highestPhysicalSlot = std::max(highestPhysicalSlot, castLibNum);
+            if (!castLib) continue;
+            const std::string castName = castLib->name();
+            if (!castName.empty() && castName.rfind("empty ", 0) != 0) {
+                namedPhysicalSlots.emplace(castName, castLibNum);
+            }
+        }
         for (const auto& rec : castlibs) {
+            // A named external slot can still contain the empty.cct placeholder
+            // after player initialization. It does not cover the real file:
+            // allow the directory walk to emit that file into a synthetic slot.
+            if (rec.memberCount == 0) continue;
             // The .cct filename's stem (e.g. "hh_pets" from "hh_pets.cct") is
             // the stable identifier across snapshot + directory-walk passes.
             const fs::path p(rec.fileName);
@@ -2228,6 +2249,9 @@ int main(int argc, char** argv) {
             // real castlib.
             const std::string fname = entry.path().filename().string();
             if (fname == "empty.cct" || fname == "empty.cst") continue;
+            // This fixture is an invalid/incomplete furniture-class cast and was
+            // never part of the known-good 739-script runtime source set.
+            if (entry.path().stem() == "hh_furni_classes") continue;
             // Skip files we already covered via the snapshot (by stem so we
             // match even if the snapshot castlib's `fileName` field is stale).
             if (coveredStems.count(entry.path().stem().string())) continue;
@@ -2238,7 +2262,7 @@ int main(int argc, char** argv) {
         std::cerr << "export_ts: directory walk found " << cctFiles.size()
                   << " additional .cct files to emit\n";
 
-        int syntheticSlot = SYNTHETIC_CASTLIB_BASE;
+        int syntheticSlot = std::max(SYNTHETIC_CASTLIB_BASE, highestPhysicalSlot + 1);
         for (const auto& cctPath : cctFiles) {
             const std::string fileName = cctPath.filename().string();
             const std::string stem = cctPath.stem().string();
@@ -2271,7 +2295,10 @@ int main(int argc, char** argv) {
             }
             const std::string castName = stem;
             const std::string castNameSafe = castName;
-            const int slot = syntheticSlot++;
+            const auto physicalSlot = namedPhysicalSlots.find(stem);
+            const int slot = physicalSlot != namedPhysicalSlots.end()
+                ? physicalSlot->second
+                : syntheticSlot++;
 
             // Build the file path.
             std::string safeName = sanitizeAssetName(castNameSafe);

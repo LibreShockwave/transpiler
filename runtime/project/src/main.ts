@@ -143,7 +143,20 @@ void (async () => {
     scriptsByName.set(module.lsScriptName, module);
     scriptsByCastMember.set(`${module.lsCastLib}:${module.lsCastMember}`, module);
   }
-
+  // Emitted legacy scripts can read a declared Director global as a bare JS
+  // identifier before any handler assigns it. Publish every declared global as
+  // VOID up front so those reads follow Lingo semantics instead of throwing a
+  // JavaScript ReferenceError.
+  for (const module of scriptsByName.values()) {
+    for (const match of module.lsLingoSource.matchAll(/^\s*global\s+(.+)$/gim)) {
+      for (const rawName of (match[1] ?? "").split(",")) {
+        const name = rawName.trim();
+        if (name && !(name in globalThis)) {
+          (globalThis as unknown as Record<string, runtime.LingoValue>)[name] = undefined;
+        }
+      }
+    }
+  }
   for (const castlibInfo of manifest.castlibs ?? []) {
     const module = (await import(/* @vite-ignore */ `/${castlibInfo.file}`)) as CastlibModule;
     for (const member of module.lsMembers) {
@@ -304,12 +317,9 @@ void (async () => {
     { module: ScriptModule; handler: ScriptModule["lsHandlers"][number] }
   >();
   for (const module of scriptsByName.values()) {
+    if (module.lsScriptType !== "MovieScript") continue;
     for (const handler of module.lsHandlers) {
-      const current = globalHandlerOwners.get(handler.name);
-      if (!current || (
-        module.lsScriptType === "MovieScript"
-        && current.module.lsScriptType !== "MovieScript"
-      )) {
+      if (!globalHandlerOwners.has(handler.name)) {
         globalHandlerOwners.set(handler.name, { module, handler });
       }
     }
