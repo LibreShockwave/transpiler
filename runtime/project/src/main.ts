@@ -232,10 +232,6 @@ void (async () => {
   ): runtime.LingoValue => {
     const implementation = module.lsHandlerStubs[handlerName];
     if (!implementation) return undefined;
-    if (["Execute", "register", "executeMessage", "updateState", "showHotel", "showEntryBar", "hideAll", "construct", "initAll", "initThread", "buildThreadObj"].includes(handlerName)) {
-      // eslint-disable-next-line no-console
-      console.log("[invoke]", module.lsScriptName, handlerName, args.map((a) => String(a)).join(","));
-    }
     host.pushParams(args);
     host.pushCastLib(module.lsCastLib);
     try {

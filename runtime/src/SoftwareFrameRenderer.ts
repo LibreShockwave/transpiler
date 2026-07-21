@@ -43,6 +43,23 @@ export function isSpecialCompositingInk(ink: InkMode): boolean {
   );
 }
 
+/** Render a Director #shape sprite as an opaque filled rectangle. */
+function shapeBitmap(sprite: RenderSprite): Bitmap | null {
+  const w = Math.max(0, Math.floor(sprite.width));
+  const h = Math.max(0, Math.floor(sprite.height));
+  if (w <= 0 || h <= 0) {
+    return null;
+  }
+  let rgb = sprite.foreColor;
+  if (!sprite.hasForeColor && sprite.hasBackColor) {
+    rgb = sprite.backColor;
+  }
+  const color = (0xff000000 | (rgb & 0x00ffffff)) >>> 0;
+  const argb = new Uint32Array(w * h);
+  argb.fill(color);
+  return new Bitmap(w, h, 32, argb);
+}
+
 /** Composes a frame's sprites into a stage Bitmap. Mirrors SoftwareFrameRenderer::renderFrame. */
 export function renderFrame(snapshot: FrameSnapshot, stageWidth: number, stageHeight: number): Bitmap {
   if (stageWidth < 0 || stageHeight < 0) {
@@ -70,7 +87,10 @@ export function renderFrame(snapshot: FrameSnapshot, stageWidth: number, stageHe
     if (!sprite.visible) {
       continue;
     }
-    const baked = sprite.bakedBitmap;
+    let baked = sprite.bakedBitmap;
+    if ((baked === null || baked.width() <= 0 || baked.height() <= 0 || baked.pixels().length === 0) && sprite.type === "shape") {
+      baked = shapeBitmap(sprite);
+    }
     if (baked === null || baked.width() <= 0 || baked.height() <= 0 || baked.pixels().length === 0) {
       continue;
     }

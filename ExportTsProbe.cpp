@@ -31,6 +31,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -493,13 +494,6 @@ void loadCoreExternalCasts(ls::player::Player& player, const fs::path& moviePath
                     castLib->load();
                 }
                 castLib->setName(castName);
-                std::cerr << "export_ts: debug: loaded external cast " << castName
-                          << " into slot " << slot
-                          << " loaded=" << castLib->isLoaded()
-                          << " members=" << castLib->memberCount() << "\n";
-            } else {
-                std::cerr << "export_ts: debug: loaded external cast " << castName
-                          << " into slot " << slot << " (no castLib)\n";
             }
         } catch (const std::exception& e) {
             std::cerr << "export_ts: warning: exception loading external cast " << castName
@@ -704,14 +698,16 @@ void preBakeCastMemberAssets(
     const fs::path& outDir,
     std::unordered_set<std::string>& writtenBitmaps,
     std::unordered_map<std::string, std::string>& memberNameToBitmapAsset,
-    std::vector<CastMemberRecord>& castMembers) {
+    std::vector<CastMemberRecord>& castMembers,
+    const std::vector<std::pair<int, std::shared_ptr<ls::player::cast::CastLib>>>& extraCastlibs) {
 
     auto& baker = player.spriteBaker();
     const int initialTick = baker.tickCounter();
 
-    for (const auto& [castLibNum, castLib] : player.castLibManager().castLibs()) {
+    const auto bakeCastLibMembers = [&](int castLibNum,
+                                        const std::shared_ptr<ls::player::cast::CastLib>& castLib) {
         if (!castLib) {
-            continue;
+            return;
         }
         for (const auto& [memberNumber, memberChunk] : castLib->memberChunks()) {
             if (!memberChunk) {
@@ -800,6 +796,18 @@ void preBakeCastMemberAssets(
                 memberNameToBitmapAsset.emplace(memberName, bakedAsset);
             }
         }
+    };
+
+    for (const auto& [castLibNum, castLib] : player.castLibManager().castLibs()) {
+        bakeCastLibMembers(castLibNum, castLib);
+    }
+
+    // player.play() may unload external cast member chunks from the active
+    // player while keeping them in our pre-play snapshot. Re-bake from the
+    // snapshot so locale-specific bitmaps (e.g. hh_entry_au.cct) are not
+    // lost before they can be written to assets/bitmaps/.
+    for (const auto& [castLibNum, castLib] : extraCastlibs) {
+        bakeCastLibMembers(castLibNum, castLib);
     }
 
     baker.setTickCounter(initialTick);
@@ -1303,11 +1311,6 @@ int main(int argc, char** argv) {
                 if (!player.loadExternalCastFromCachedData(num, castData)) {
                     std::cerr << "export_ts: warning: failed to load external cast data for "
                               << castLib->fileName() << "\n";
-                } else {
-                    std::cerr << "export_ts: debug: loaded external cast " << num
-                              << " name=" << castLib->name()
-                              << " members=" << castLib->memberCount()
-                              << "\n";
                 }
             }
             player.castLibManager().preloadCasts(2);
@@ -1326,6 +1329,20 @@ int main(int argc, char** argv) {
             }
         }
 
+        // Determine the active locale entry casts from external_variables.txt so
+        // we can drop the placeholder casts for other locales from the snapshot.
+        // The DCR pre-registers every locale-specific entry cast and embeds its
+        // scripts, but only the active locale's `.cct` is actually loaded.
+        const std::unordered_set<std::string> allowedEntryCasts = [&]() {
+            std::unordered_set<std::string> set;
+            for (const auto& [_, castName] : readExternalVariableCastEntries(options.moviePath)) {
+                if (castName.rfind("hh_entry_", 0) == 0) {
+                    set.insert(castName);
+                }
+            }
+            return set;
+        }();
+
         // Snapshot the loaded external cast libraries (num -> castLib) before
         // player.play() runs, since play() can drop members from casts that are
         // not part of the score. The castlib emission loop uses this snapshot so
@@ -1336,12 +1353,35 @@ int main(int argc, char** argv) {
             if (!castLib) continue;
             if (!castLib->isExternal()) continue;
             if (castLib->memberCount() == 0) continue;
+            const std::string name = lowerCopy(castLib->name());
+            if (name.rfind("hh_entry_", 0) == 0 && !allowedEntryCasts.count(name)) {
+                continue;
+            }
             externalLibsSnapshot.emplace_back(num, castLib);
         }
         std::sort(externalLibsSnapshot.begin(), externalLibsSnapshot.end(),
                   [](const auto& a, const auto& b) { return a.first < b.first; });
         std::cerr << "export_ts: snapshotted " << externalLibsSnapshot.size()
                   << " external castlibs for TS emission\n";
+
+        // Make sure the bitmap output directory exists before pre-baking; the rest
+        // of the project skeleton is created later, after play().
+        fs::create_directories(options.outDir / "assets" / "bitmaps");
+
+        // Baked-bitmap asset dedup: same cast member + size yields identical RGBA,
+        // so write it once as assets/bitmaps/m<id>_w<W>_h<H>.rgba and reference it.
+        std::unordered_set<std::string> writtenBitmaps;
+        // Member-name -> first baked bitmap seen (used by Lingo member("name") swaps at runtime).
+        std::unordered_map<std::string, std::string> memberNameToBitmapAsset;
+
+        // Pre-bake every renderable cast member BEFORE player.play() unloads external
+        // cast member chunks. The snapshot above still holds the loaded castlibs, so
+        // we also bake from it to catch locale-specific casts that the player manager
+        // drops during play().
+        std::vector<CastMemberRecord> castMembers;
+        preBakeCastMemberAssets(player, *directorFile, options.outDir, writtenBitmaps,
+                                memberNameToBitmapAsset, castMembers, externalLibsSnapshot);
+        logMemoryUsage("after prebake");
 
         // For Lingo export (Stage 7) the behavior manager needs the movie foundation prepared
         // so external-cast behavior references resolve. play() loads casts and registers scripts;
@@ -1367,6 +1407,27 @@ int main(int argc, char** argv) {
         }
         logMemoryUsage("after cast load");
 
+        // After player initialization the placeholder locale casts have their real
+        // names (e.g. "hh_entry_us").  Drop any locale-specific entry casts that
+        // are not the active locale from the snapshot; keeping all of them causes
+        // global script-name collisions in the TypeScript runtime.
+        {
+            auto it = externalLibsSnapshot.begin();
+            while (it != externalLibsSnapshot.end()) {
+                const auto& castLib = it->second;
+                const std::string name = castLib ? lowerCopy(castLib->name()) : "";
+                if (!name.empty() && name.rfind("hh_entry_", 0) == 0 && !allowedEntryCasts.count(name)) {
+                    it = externalLibsSnapshot.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            std::sort(externalLibsSnapshot.begin(), externalLibsSnapshot.end(),
+                      [](const auto& a, const auto& b) { return a.first < b.first; });
+            std::cerr << "export_ts: snapshotted " << externalLibsSnapshot.size()
+                      << " external castlibs for TS emission after locale filter\n";
+        }
+
         const int frameCount = player.frameCount();
         if (frameCount <= 0) {
             throw std::runtime_error("Movie reports no frames to export");
@@ -1375,7 +1436,6 @@ int main(int argc, char** argv) {
 
         // Output tree.
         fs::create_directories(options.outDir / "src");
-        fs::create_directories(options.outDir / "assets" / "bitmaps");
         fs::create_directories(options.outDir / "assets" / "reference");
         fs::create_directories(options.outDir / "assets" / "sounds");
         fs::create_directories(options.outDir / "test");
@@ -1419,20 +1479,6 @@ int main(int argc, char** argv) {
             }
         }
 
-        // Baked-bitmap asset dedup: same cast member + size yields identical RGBA,
-        // so write it once as assets/bitmaps/m<id>_w<W>_h<H>.rgba and reference it.
-        std::unordered_set<std::string> writtenBitmaps;
-        // Member-name -> first baked bitmap seen (used by Lingo member("name") swaps at runtime).
-        std::unordered_map<std::string, std::string> memberNameToBitmapAsset;
-
-        // Pre-bake every renderable cast member. This gives the runtime assets for
-        // Lingo-driven member swaps and sub-frame filmloop animation. The per-member
-        // pixel cap inside bakeAndWriteAsset prevents runaway text/data-buffer members
-        // from exhausting memory.
-        std::vector<CastMemberRecord> castMembers;
-        preBakeCastMemberAssets(player, *directorFile, options.outDir, writtenBitmaps,
-                                memberNameToBitmapAsset, castMembers);
-        logMemoryUsage("after prebake");
 
         std::vector<FrameRecord> frameRecords;
         frameRecords.reserve(static_cast<std::size_t>(framesToExport));
@@ -2227,6 +2273,7 @@ int main(int argc, char** argv) {
                 namedPhysicalSlots.emplace(castName, castLibNum);
             }
         }
+
         for (const auto& rec : castlibs) {
             // A named external slot can still contain the empty.cct placeholder
             // after player initialization. It does not cover the real file:
@@ -2255,6 +2302,12 @@ int main(int argc, char** argv) {
             // Skip files we already covered via the snapshot (by stem so we
             // match even if the snapshot castlib's `fileName` field is stale).
             if (coveredStems.count(entry.path().stem().string())) continue;
+            // Skip locale-specific entry casts that are not the active locale;
+            // the active one is already covered by the snapshot above.
+            const std::string stem = entry.path().stem().string();
+            if (stem.rfind("hh_entry_", 0) == 0 && !allowedEntryCasts.count(stem)) {
+                continue;
+            }
             cctFiles.push_back(entry.path());
         }
         std::sort(cctFiles.begin(), cctFiles.end());

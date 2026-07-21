@@ -56,6 +56,24 @@ export const LINGO_VOID_SENTINEL = Symbol("LINGO_VOID");
  */
 export let LINGO_VOID: LingoValue;
 
+// Track the script whose handler is currently executing.  Director's message
+// dispatch is caller-context sensitive: a handler invoked on an ancestor must
+// continue searching for messages from that ancestor's layer, not restart at
+// the leaf instance.  The transpiler's `me.foo()` shortcut would otherwise
+// always resolve to the leaf script and break inherited handlers such as
+// `Unique Element Class.define` calling `me.flipH()` on a `Common Button Class`
+// instance.
+const scriptContextStack: string[] = [];
+export function pushScriptContext(name: string): void {
+  scriptContextStack.push(name);
+}
+export function popScriptContext(): void {
+  scriptContextStack.pop();
+}
+export function currentScriptContext(): string | undefined {
+  return scriptContextStack[scriptContextStack.length - 1];
+}
+
 // Director lists are 1-indexed: index 1 is the first element, index 0 and out-of-range access
 // are runtime errors (matching Lingo's "index out of range"). This is the container the emitted
 // handlers and the future executor use for `[...]` literals and `list(...)` / `add` calls.
@@ -1264,9 +1282,36 @@ export function callMethod(name: string, ...args: LingoValue[]): LingoValue {
   if (args.length > 0) {
     const me = args[0];
     if (me !== null && typeof me === "object") {
+      // When a script instance receives a message inside another handler, use the
+      // host's instance dispatcher so ancestor handlers resolve messages from
+      // their own layer rather than from the leaf script.  The current context is
+      // empty only for top-level/native calls such as bootstrap manager helpers.
+      // Guard with `instanceof Map` because some Lingo values (e.g. LingoPropList)
+      // expose a `.props`-like object whose `.get` is not the Map method.
+      const props = (me as { props?: Map<string, unknown> }).props;
+      const scriptName = props instanceof Map ? props.get("__scriptName") : void 0;
+      if (typeof scriptName === "string" && currentScriptContext() !== undefined) {
+        const host = getLingoHost();
+        if (host) {
+          return host.callBuiltin("callMethod", [name, ...args]);
+        }
+      }
       const fn = (me as Record<string, unknown>)[name];
       if (typeof fn === "function") {
-        return (fn as (...a: unknown[]) => unknown).apply(me, args.slice(1)) as LingoValue;
+        const result = (fn as (...a: unknown[]) => unknown).apply(me, args.slice(1)) as LingoValue;
+        // Runtime fallback: Director's Resource Manager only indexes cast members that
+        // have been pre-loaded into its internal name table. The TS host keeps an
+        // authoritative registry of every exported castlib, so when a scripted
+        // `getmemnum` comes up empty let the host resolve the name across all registered
+        // castlibs. This is required for Habbo's visualizer-driven hotel view, which
+        // references bitmap members that live in region-specific `.cct` files.
+        if (name.toLowerCase() === "getmemnum" && (!result || Number(result) < 1)) {
+          const host = getLingoHost();
+          if (host) {
+            return host.callBuiltin("callMethod", [name, ...args]);
+          }
+        }
+        return result;
       }
       // Bootstrap fix: managers may be re-entered while their instance is already
       // in pObjectList but not yet moved to pManagerList. Treat pObjectList
@@ -2224,11 +2269,24 @@ export function timeout(name: LingoValue): { new: (_period: LingoValue, _handler
   };
 }
 
-/** `rgb(r, g, b)` — create a simple colour token with a hexString method. */
+/** `rgb(r, g, b)` — create a simple colour token with a hexString method.
+ *  Also accepts a single `"#RRGGBB"` string, which the layout parser passes
+ *  for shape/field colour properties parsed from the XML-like definitions. */
 export function rgb(r: LingoValue, g: LingoValue, b: LingoValue): LingoValue {
-  const red = Math.max(0, Math.min(255, integer(r)));
-  const green = Math.max(0, Math.min(255, integer(g)));
-  const blue = Math.max(0, Math.min(255, integer(b)));
+  let red: number;
+  let green: number;
+  let blue: number;
+  if ((g === undefined || g === null || Number.isNaN(integer(g))) && typeof r === "string") {
+    const hex = r.trim();
+    const parsed = hex.startsWith("#") ? parseInt(hex.slice(1), 16) : parseInt(hex, 16);
+    red = (parsed >> 16) & 0xff;
+    green = (parsed >> 8) & 0xff;
+    blue = parsed & 0xff;
+  } else {
+    red = Math.max(0, Math.min(255, integer(r)));
+    green = Math.max(0, Math.min(255, integer(g)));
+    blue = Math.max(0, Math.min(255, integer(b)));
+  }
   const hex = ((red << 16) | (green << 8) | blue).toString(16).padStart(6, "0").toUpperCase();
   return {
     red,

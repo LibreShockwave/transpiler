@@ -6,7 +6,7 @@
 // LingoNotImplemented so failures are loud rather than silently wrong.
 
 import type { Bitmap } from "./Bitmap.js";
-import { buildSprite, type BitmapLoader, type ScoreJson, type ScoreSpriteJson } from "./ScoreData.js";
+import { buildSprite, coerceSpriteType, type BitmapLoader, type ScoreJson, type ScoreSpriteJson } from "./ScoreData.js";
 import { inkModeFromCode } from "./InkMode.js";
 import type { FrameSnapshot, RenderSprite } from "./FrameSnapshot.js";
 import type { ScorePlayer } from "./ScorePlayer.js";
@@ -33,6 +33,9 @@ import {
   LINGO_VOID,
   meProp,
   setMeProp,
+  pushScriptContext,
+  popScriptContext,
+  currentScriptContext,
 } from "./lingo-runtime.js";
 import {
   getNetText,
@@ -617,7 +620,7 @@ export class LingoRuntimeHost implements LingoHost {
       case "member":
       case "castnum":
       case "membernum":
-        return this.memberFromSprite(sprite);
+        return new LingoMemberProxy(this.memberFromSprite(sprite), this);
       case "cursor":
         return null;
       case "palette":
@@ -791,8 +794,16 @@ export class LingoRuntimeHost implements LingoHost {
         ? this.loadBitmap(member.bakedBitmapAsset)
         : null;
       sprite.bakedBitmap = baked;
-      sprite.width = baked?.width() ?? member.bakedWidth;
-      sprite.height = baked?.height() ?? member.bakedHeight;
+      // Some exported cast members (notably #shape members) carry no baked
+      // dimensions. The visualizer assigns explicit widths/heights from the layout
+      // definition, so keep those when the member metadata is empty.
+      if (member.bakedWidth > 0) {
+        sprite.width = member.bakedWidth;
+      }
+      if (member.bakedHeight > 0) {
+        sprite.height = member.bakedHeight;
+      }
+      sprite.type = coerceSpriteType(member.type);
       this.setSpriteLocH(sprite, oldLocH);
       this.setSpriteLocV(sprite, oldLocV);
     } else {
@@ -807,6 +818,7 @@ export class LingoRuntimeHost implements LingoHost {
     }
     if (isMemberToken(value)) {
       if (typeof value.id === "number" && this.isDynamicMemberId(value.id)) {
+        const dyn = this.dynamicMembers.get(value.id);
         const image = this.dynamicMemberImages.get(value.id);
         this.spriteMemberTokens.set(sprite, { id: value.id, castLib: value.castLib });
         if (image instanceof LingoImage) {
@@ -815,10 +827,12 @@ export class LingoRuntimeHost implements LingoHost {
           sprite.bakedBitmap = image.bitmap;
           sprite.width = image.width;
           sprite.height = image.height;
+          sprite.type = coerceSpriteType(dyn?.type ?? "bitmap");
           this.setSpriteLocH(sprite, oldLocH);
           this.setSpriteLocV(sprite, oldLocV);
         } else {
           sprite.bakedBitmap = null;
+          sprite.type = coerceSpriteType(dyn?.type ?? "bitmap");
         }
         return;
       }
@@ -1110,7 +1124,23 @@ export class LingoRuntimeHost implements LingoHost {
         return dyn.text;
       }
       if (lower === "image") {
-        return this.dynamicMemberImages.get(dyn.id);
+        const existing = this.dynamicMemberImages.get(dyn.id);
+        if (existing !== undefined) {
+          return existing;
+        }
+        // Text/field members do not have a baked bitmap asset, but scripts
+        // such as Common Button Class read member(...).image to build button
+        // labels. Generate a blank surface sized from the member's rect so
+        // image-based UI construction can proceed.
+        if (dyn.type === "text" || dyn.type === "field") {
+          const props = this.memberRuntimeProps.get(`dynamic:${dyn.id}`);
+          const width = Math.max(1, Number(props?.get("rect")?.width ?? props?.get("width") ?? 1) || 1);
+          const height = Math.max(1, Number(props?.get("rect")?.height ?? props?.get("height") ?? 1) || 1);
+          const img = new LingoImage(width, height, 32);
+          this.dynamicMemberImages.set(dyn.id, img);
+          return img;
+        }
+        return existing;
       }
       return this.memberRuntimeProps.get(`dynamic:${dyn.id}`)?.get(lower);
     }
@@ -1368,6 +1398,10 @@ export class LingoRuntimeHost implements LingoHost {
         return this.score.stageWidth;
       case "stageheight":
         return this.score.stageHeight;
+      case "milliseconds":
+        return Date.now() - this.state.startTime;
+      case "frametempo":
+        return this.player.tempo(this.currentFrame());
       case "stageleft":
         return 0;
       case "stageright":
@@ -1640,8 +1674,25 @@ export class LingoRuntimeHost implements LingoHost {
         const handler = isSymbol(args[0]) ? args[0].name : String(args[0] ?? "");
         const target = args[1];
         const methodArgs = args.slice(2);
-        const invoke = (value: LingoValue): LingoValue =>
-          this.callBuiltin("callMethod", [handler, value, ...methodArgs]);
+        // Director's `call(#handler, target, ...)` is a dynamic message send to
+        // the target object.  The handler must be resolved starting from the
+        // target's own script layer, not from the caller's current handler layer,
+        // otherwise inherited base-class handlers cannot dynamically invoke
+        // leaf-class handlers (e.g. Object Base Class executeDelay calling
+        // #addAnimTask on the Entry Interface instance).
+        const invoke = (value: LingoValue): LingoValue => {
+          const savedContext = currentScriptContext();
+          if (savedContext) {
+            popScriptContext();
+          }
+          try {
+            return this.callBuiltin("callMethod", [handler, value, ...methodArgs]);
+          } finally {
+            if (savedContext) {
+              pushScriptContext(savedContext);
+            }
+          }
+        };
         if (target instanceof LingoList) {
           return new LingoList(target.toArray().map(invoke));
         }

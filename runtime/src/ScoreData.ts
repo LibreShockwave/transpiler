@@ -119,7 +119,7 @@ export interface ScoreJson {
 /** Resolve a baked-bitmap asset path to a decoded Bitmap, or null if absent. Caller caches. */
 export type BitmapLoader = (assetPath: string) => Bitmap | null;
 
-function coerceSpriteType(type: string): SpriteType {
+export function coerceSpriteType(type: string): SpriteType {
   // The C++ exporter emits `rsp::name(sprite.type())`, which is UPPER_SNAKE_CASE
   // (e.g. "BITMAP", "TEXT", "SHAPE", "FILM_LOOP", "UNKNOWN"). The runtime SpriteType
   // is lowercase ("bitmap", "filmloop", ...). Normalize so the real type survives into
