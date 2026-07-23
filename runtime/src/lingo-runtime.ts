@@ -30,6 +30,7 @@ export type LingoValue =
   | boolean
   | null
   | undefined
+  | bigint
   | number[]
   | LingoList
   | LingoPropList
@@ -102,6 +103,41 @@ function lingoValuesEqual(a: LingoValue, b: LingoValue): boolean {
   if (a === b) {
     return true;
   }
+  // Director's VOID and JavaScript undefined both represent an unset Lingo value.
+  // Emitted equality tests compare a Lingo variable against the literal undefined,
+  // so VOID must be considered equal to undefined.
+  if ((a === LINGO_VOID || a === undefined || a === null) &&
+      (b === LINGO_VOID || b === undefined || b === null)) {
+    return true;
+  }
+  // Director compares list values structurally. LibreShockwave's Datum equality
+  // likewise compares List items and PropList entries recursively, rather than
+  // comparing the container identities. Habbo's build receipt is independently
+  // constructed on each side and relies on this behavior.
+  if (a instanceof LingoList && b instanceof LingoList) {
+    if (a.count !== b.count) return false;
+    for (let index = 1; index <= a.count; ++index) {
+      if (!lingoValuesEqual(a.get(index), b.get(index))) return false;
+    }
+    return true;
+  }
+  if (a instanceof LingoPropList && b instanceof LingoPropList) {
+    if (a.count !== b.count) return false;
+    for (let index = 1; index <= a.count; ++index) {
+      if (!lingoValuesEqual(a.keyAt(index), b.keyAt(index)) ||
+          !lingoValuesEqual(a.getAt(index), b.getAt(index))) return false;
+    }
+    return true;
+  }
+  // LibreShockwave/Director numeric comparison coerces VOID to zero. Habbo's
+  // visualizer APIs rely on this when a missing prop-list entry is tested with
+  // `result <> 0` to terminate numbered-sprite discovery loops.
+  if ((a === LINGO_VOID || a === undefined || a === null) && typeof b === "number") {
+    return b === 0;
+  }
+  if ((b === LINGO_VOID || b === undefined || b === null) && typeof a === "number") {
+    return a === 0;
+  }
   if (isSymbol(a) && isSymbol(b)) {
     return a.name === b.name;
   }
@@ -125,6 +161,19 @@ export class LingoList {
         if (typeof prop === "string") {
           if (prop === "length" || prop === "count") {
             return target.count;
+          }
+          // Director point/rect values are list-like, but also expose named
+          // coordinate and extent properties. `rect.width` is right-left and
+          // `rect.height` is bottom-top (not the raw third/fourth entries).
+          if (prop === "x" || prop === "left") return target.items[0] ?? 0;
+          if (prop === "y" || prop === "top") return target.items[1] ?? 0;
+          if (prop === "right") return target.items[2] ?? 0;
+          if (prop === "bottom") return target.items[3] ?? 0;
+          if (prop === "width" && target.items.length >= 4) {
+            return float(target.items[2]) - float(target.items[0]);
+          }
+          if (prop === "height" && target.items.length >= 4) {
+            return float(target.items[3]) - float(target.items[1]);
           }
           // Lingo scripts use `x.ilk` to query the runtime type of `x` — the transpiler
           // emits `someValue.ilk` as a property access, so the LingoList/LingoPropList proxies
@@ -161,6 +210,13 @@ export class LingoList {
             target.set(index, value as LingoValue);
             return true;
           }
+        }
+        const namedIndex = typeof prop === "string"
+          ? ({ x: 1, left: 1, y: 2, top: 2, right: 3, bottom: 4 } as Record<string, number>)[prop]
+          : undefined;
+        if (namedIndex !== undefined) {
+          target.set(namedIndex, value as LingoValue);
+          return true;
         }
         const num = Number(prop);
         if (Number.isInteger(num) && num >= 1) {
@@ -313,7 +369,9 @@ export class LingoList {
 // iteration, matching Director's propList semantics.
 export class LingoPropList {
   private readonly keys: string[] = [];
+  private readonly origKeys: LingoValue[] = [];
   private readonly vals: LingoValue[] = [];
+  private runtimeIlk = "propList";
 
   constructor(initialItems?: readonly LingoValue[] | null) {
     if (Array.isArray(initialItems)) {
@@ -328,6 +386,7 @@ export class LingoPropList {
           const k = lingoKeyToString(pair[0] as LingoValue);
           if (k !== undefined) {
             this.keys.push(k);
+            this.origKeys.push(pair[0] as LingoValue);
             this.vals.push(pair[1] as LingoValue);
           }
         }
@@ -336,6 +395,7 @@ export class LingoPropList {
           const k = lingoKeyToString(initialItems[i] as LingoValue);
           if (k !== undefined) {
             this.keys.push(k);
+            this.origKeys.push(initialItems[i] as LingoValue);
             this.vals.push(initialItems[i + 1] as LingoValue);
           }
         }
@@ -367,7 +427,7 @@ export class LingoPropList {
           }
         }
         if (prop === "ilk") {
-          return symbol("propList");
+          return symbol(target.runtimeIlk);
         }
         const key = typeof prop === "string" ? prop : lingoKeyToString(prop as unknown as LingoValue);
         if (key !== undefined) {
@@ -411,6 +471,11 @@ export class LingoPropList {
 
   get count(): number {
     return this.keys.length;
+  }
+
+  markAsStruct(): this {
+    this.runtimeIlk = "struct";
+    return this;
   }
 
   private normalizeKey(key: LingoValue): string | undefined {
@@ -457,9 +522,11 @@ export class LingoPropList {
     const i = this.findKeyIndex(key);
     if (i >= 0) {
       this.vals[i] = value;
+      this.origKeys[i] = key;
       return;
     }
     this.keys.push(k);
+    this.origKeys.push(key);
     this.vals.push(value);
   }
 
@@ -499,6 +566,7 @@ export class LingoPropList {
     const i = this.findKeyIndex(key);
     if (i >= 0) {
       this.keys.splice(i, 1);
+      this.origKeys.splice(i, 1);
       this.vals.splice(i, 1);
     }
   }
@@ -507,7 +575,7 @@ export class LingoPropList {
     if (!Number.isInteger(index) || index < 1 || index > this.keys.length) {
       return undefined;
     }
-    return this.keys[index - 1];
+    return this.origKeys[index - 1];
   }
 
   findPos(key: LingoValue): number | undefined {
@@ -523,7 +591,7 @@ export class LingoPropList {
     if (!Number.isInteger(index) || index < 1 || index > this.keys.length) {
       return undefined;
     }
-    return this.keys[index - 1];
+    return this.origKeys[index - 1];
   }
 
   remove(key: LingoValue): void {
@@ -535,6 +603,7 @@ export class LingoPropList {
       return;
     }
     this.keys.splice(index - 1, 1);
+    this.origKeys.splice(index - 1, 1);
     this.vals.splice(index - 1, 1);
   }
 
@@ -573,16 +642,18 @@ export class LingoPropList {
 
   getOne(value: LingoValue): LingoValue {
     const index = this.vals.findIndex((item) => lingoValuesEqual(item, value));
-    return index >= 0 ? this.keys[index] : 0;
+    return index >= 0 ? this.origKeys[index] : 0;
   }
 
   sort(): this {
-    const pairs = this.keys.map((k, i) => [k, this.vals[i]] as [string, LingoValue]);
+    const pairs = this.keys.map((k, i) => [k, this.origKeys[i], this.vals[i]] as [string, LingoValue, LingoValue]);
     pairs.sort((a, b) => a[0].localeCompare(b[0]));
     this.keys.length = 0;
+    this.origKeys.length = 0;
     this.vals.length = 0;
-    for (const [k, v] of pairs) {
+    for (const [k, ok, v] of pairs) {
       this.keys.push(k);
+      this.origKeys.push(ok);
       this.vals.push(v);
     }
     return this;
@@ -590,8 +661,9 @@ export class LingoPropList {
 
   duplicate(): LingoPropList {
     const copy = new LingoPropList();
+    if (this.runtimeIlk === "struct") copy.markAsStruct();
     for (let i = 0; i < this.keys.length; ++i) {
-      copy.add(this.keys[i], duplicate(this.vals[i]));
+      copy.add(this.origKeys[i], duplicate(this.vals[i]));
     }
     return copy;
   }
@@ -854,6 +926,9 @@ export class LingoMemberProxy {
 
   get number(): number { return Number(this.host.getMemberProp(this.token, "number")) || 0; }
 
+  /** Director's `member(...).castLibNum` property. */
+  get castLibNum(): number { return Number(this.host.getMemberProp(this.token, "castLib")) || 0; }
+
   get text(): LingoValue { return this.host.getMemberProp(this.token, "text"); }
   set text(v: LingoValue) { this.host.setMemberProp(this.token, "text", v); }
 
@@ -868,6 +943,9 @@ export class LingoMemberProxy {
     return typeof v === "string" ? symbol(v) : (v as LingoSymbol);
   }
 
+  /** `member(...).script` returns the script reference for a script member. */
+  get script(): LingoValue { return this.host.getMemberProp(this.token, "script"); }
+
   // The transpiler emits Lingo member properties that collide with JavaScript
   // builtins as `_<name>` (e.g. `member(...)._number`, `member(...)._type`).
   // Wire those aliases to the canonical getters above so script instantiation
@@ -875,6 +953,8 @@ export class LingoMemberProxy {
   get _name(): string { return this.name; }
   set _name(v: LingoValue) { this.name = v; }
   get _number(): number { return this.number; }
+  get _castlibnum(): number { return this.castLibNum; }
+  get _script(): LingoValue { return this.script; }
   get _text(): LingoValue { return this.text; }
   set _text(v: LingoValue) { this.text = v; }
   get _width(): number { return this.width; }
@@ -1298,7 +1378,14 @@ export function callMethod(name: string, ...args: LingoValue[]): LingoValue {
       }
       const fn = (me as Record<string, unknown>)[name];
       if (typeof fn === "function") {
-        const result = (fn as (...a: unknown[]) => unknown).apply(me, args.slice(1)) as LingoValue;
+        const callArgs = args.slice(1);
+        // Director passes VOID for omitted trailing arguments. Pad to the emitted
+        // handler's declared arity so generated code does not read undefined.
+        const expected = Math.max(0, (fn as { length?: number }).length ?? 0) - 1;
+        while (callArgs.length < expected) {
+          callArgs.push(LINGO_VOID);
+        }
+        const result = (fn as (...a: unknown[]) => unknown).apply(me, callArgs) as LingoValue;
         // Runtime fallback: Director's Resource Manager only indexes cast members that
         // have been pre-loaded into its internal name table. The TS host keeps an
         // authoritative registry of every exported castlib, so when a scripted
@@ -1425,7 +1512,7 @@ export function lingoBinary(
 }
 
 export function lingoTruthy(value: LingoValue): boolean {
-  if (value == null || value === false) return false;
+  if (value == null || value === false || value === LINGO_VOID) return false;
   if (typeof value === "number") return value !== 0;
   if (typeof value === "string") return value.length > 0;
   return true;
@@ -1618,8 +1705,8 @@ export function chunkOf(
   if (!type) {
     return s;
   }
-  const a = first === undefined ? 1 : integer(first);
-  const b = last === undefined ? a : integer(last);
+  const a = first === undefined || first === 0 ? 1 : integer(first);
+  const b = last === undefined || last === 0 ? a : integer(last);
   if (a < 1 || b < a) {
     return "";
   }
@@ -2000,7 +2087,7 @@ export function duplicate(value: LingoValue): LingoValue {
     const copy = new LingoPropList();
     for (let i = 1; i <= value.length; i++) {
       const key = value.keyAt(i);
-      if (typeof key === "string") {
+      if (key !== undefined) {
         copy.add(key, duplicate(value.get(key)));
       }
     }
@@ -2020,15 +2107,14 @@ export function sort(list: LingoValue): void {
     list.clear();
     for (const item of arr) list.add(item);
   } else if (list instanceof LingoPropList) {
-    const entries: [string, LingoValue][] = [];
+    const entries: [string, LingoValue, LingoValue][] = [];
     for (let i = 1; i <= list.length; i++) {
       const key = list.keyAt(i);
-      if (typeof key === "string") {
-        entries.push([key, list.get(key)]);
-      }
+      const sortKey = key === undefined ? "" : lingoKeyToString(key) ?? "";
+      entries.push([sortKey, key, list.get(key)]);
     }
     entries.sort((a, b) => a[0].localeCompare(b[0]));
-    for (const [k, v] of entries) list.add(k, v);
+    for (const [, ok, v] of entries) list.add(ok, v);
   }
 }
 
@@ -2494,6 +2580,9 @@ export function dispatchValueBuiltin(
     case "script": return { handled: true, value: script(args[0]) };
     case "ilk": return { handled: true, value: ilk(args[0], args[1]) };
     case "nothing": return { handled: true, value: undefined };
+    case "castlib": return { handled: true, value: castLib(args[0]) };
+    case "member": return { handled: true, value: member(args[0], args[1]) };
+    case "field": return { handled: true, value: field(args[0], args[1]) };
     default: return { handled: false, value: undefined };
   }
 }
@@ -2535,6 +2624,23 @@ export class LingoCastLibProxy {
 
   get number(): number { return this.num; }
   get _number(): number { return this.num; }
+
+  /** `castLib(n).member["Name"]` — Lingo shorthand for a named cast member. */
+  get member(): Record<string, LingoMemberProxy> {
+    const host = getLingoHost();
+    if (!host) return {} as Record<string, LingoMemberProxy>;
+    const num = this.num;
+    return new Proxy({} as Record<string, LingoMemberProxy>, {
+      get(_target, prop) {
+        if (typeof prop !== "string") return undefined;
+        const token = host.getMember(prop, num);
+        if (!token || typeof token !== "object" || !("id" in token)) {
+          return undefined;
+        }
+        return new LingoMemberProxy(token as { id: number | string; castLib?: number | string }, host);
+      },
+    });
+  }
 }
 
 /** `castLib(n)` — returns a cast-library token. */

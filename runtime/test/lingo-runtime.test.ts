@@ -18,6 +18,8 @@ import {
   chunkOf,
   dispatchValueBuiltin,
   lingoBinary,
+  lingoTruthy,
+  LINGO_VOID,
   SUPPORTED_LINGO_BUILTINS,
   type LingoHost,
   type LingoValue,
@@ -28,6 +30,35 @@ describe("line chunks", () => {
     expect(chunkOf("one\rtwo", "line", 2)).toBe("two");
     expect(chunkOf("one\ntwo", "line", 2)).toBe("two");
     expect(chunkOf("one\r\ntwo", "line", 2)).toBe("two");
+  });
+});
+
+describe("point and rect list properties", () => {
+  it("exposes named coordinates and computed dimensions", () => {
+    const r = new LingoList([10, 20, 42, 65]) as LingoList & {
+      left: number; top: number; right: number; bottom: number;
+      width: number; height: number;
+    };
+    expect([r.left, r.top, r.right, r.bottom]).toEqual([10, 20, 42, 65]);
+    expect([r.width, r.height]).toEqual([32, 45]);
+  });
+});
+
+describe("Director truthiness", () => {
+  it("treats VOID and scalar false values as false", () => {
+    expect(lingoTruthy(LINGO_VOID)).toBe(false);
+    expect(lingoTruthy(undefined)).toBe(false);
+    expect(lingoTruthy(0)).toBe(false);
+    expect(lingoTruthy(1)).toBe(true);
+  });
+});
+
+describe("Director VOID numeric equality", () => {
+  it("coerces VOID to zero in numeric comparisons", () => {
+    expect(lingoBinary("eq", LINGO_VOID, 0)).toBe(true);
+    expect(lingoBinary("eq", 0, LINGO_VOID)).toBe(true);
+    expect(lingoBinary("neq", LINGO_VOID, 0)).toBe(false);
+    expect(lingoBinary("neq", LINGO_VOID, 1)).toBe(true);
   });
 });
 
@@ -83,6 +114,19 @@ describe("LingoList (1-indexed)", () => {
 });
 
 describe("LingoPropList", () => {
+  it("parses window-layout element property lists", () => {
+    const parsed = value('[#member: "content.middle.middle", #media: #bitmap, #locH: 0, #locV: 0, #width: 316, #height: 143]') as LingoPropList;
+    expect(parsed.get(symbol("member"))).toBe("content.middle.middle");
+    expect(parsed.get(symbol("locH"))).toBe(0);
+    expect(parsed.get(symbol("width"))).toBe(316);
+  });
+  it("parses nested button element descriptions", () => {
+    const parsed = value('[#state: #up, #members: [#left: [#member: "button.a.left.active", #cast: 2], #middle: [#member: "button.a.middle.active", #cast: 2]], #text: [#font: "vb", #fontSize: 9]]') as LingoPropList;
+    const members = parsed.get(symbol("members")) as LingoPropList;
+    const left = members.get(symbol("left")) as LingoPropList;
+    expect(left.get(symbol("member"))).toBe("button.a.left.active");
+    expect(left.get(symbol("cast"))).toBe(2);
+  });
   it("updates duplicate keys in place and preserves insertion order", () => {
     const p = new LingoPropList();
     p.add("a", 1);
