@@ -23,6 +23,7 @@ export type CastlibRegistrar = (ref: CastlibModuleRef) => Promise<void> | void;
 
 let networkBaseUrl = "";
 let nextNetId = 1;
+let lastNetId = 0;
 const netResults = new Map<number, { done: number; error: string; text: string }>();
 const netResultsByUrl = new Map<string, { done: number; error: string; text: string }>();
 
@@ -75,6 +76,7 @@ function resolveUrl(url: LingoValue): string {
 
 export function getNetText(url: LingoValue): number {
   const id = nextNetId++;
+  lastNetId = id;
   const fullUrl = resolveUrl(url);
   const result = { done: 0, error: "OK", text: "" };
   netResults.set(id, result);
@@ -118,7 +120,13 @@ export function getNetText(url: LingoValue): number {
 
 export function netDone(netId?: LingoValue): number {
   if (netId === undefined) {
-    return 1;
+    // LibreShockwave semantics: `netDone()` (no arg) reflects the most recently
+    // started net task. With no current task it resolves to done (1); while the
+    // last task is still in progress it is 0; once it completes (or fails) it is
+    // 1 again. The Habbo boot's `init` score script polls this to gate
+    // `initializeAndRun()` behind `preloadNetThing(fuse_client.cct)`.
+    const last = lastNetId > 0 ? netResults.get(lastNetId) : undefined;
+    return last && !last.done ? 0 : 1;
   }
   const id = Number(netId);
   const r = netResults.get(id);
@@ -127,7 +135,8 @@ export function netDone(netId?: LingoValue): number {
 
 export function netError(netId?: LingoValue): string {
   if (netId === undefined) {
-    return "OK";
+    const last = lastNetId > 0 ? netResults.get(lastNetId) : undefined;
+    return last?.error ?? "OK";
   }
   const id = Number(netId);
   const r = netResults.get(id);
@@ -159,6 +168,7 @@ export function getStreamStatus(netId: LingoValue): LingoValue {
 
 export function preloadNetThing(url: LingoValue): number {
   const id = nextNetId++;
+  lastNetId = id;
   const fullUrl = resolveUrl(url);
   const fileName = requestedFileName(fullUrl);
   const result: { done: number; error: string; text: string } = { done: 0, error: "OK", text: "" };

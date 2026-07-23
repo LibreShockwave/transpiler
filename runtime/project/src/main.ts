@@ -204,6 +204,14 @@ void (async () => {
   }));
   setCastlibModuleMap(castlibRefs);
   setCastlibRegistrar(registerCastlibModule);
+  // Pre-declare every external castlib's identity (number/name/fileName) from the
+  // manifest up front. The movie's DCR declares these slots before their members
+  // load, so Lingo `castLib(n).fileName` / `castLib(n).name` must resolve at boot
+  // for `preloadNetThing(castLib(n).fileName)` to drive the lazy module load. The
+  // member tables stay empty until `registerCastlib` fills them on demand.
+  for (const ref of castlibRefs) {
+    host.declareCastlib(ref.number, ref.name, ref.fileName);
+  }
 
   host.setCastlibImportCallback((liveSlot, _castName, templateSlot) => {
     liveSlotToTemplate.set(liveSlot, templateSlot);

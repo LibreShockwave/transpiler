@@ -321,6 +321,34 @@ export class LingoRuntimeHost implements LingoHost {
     return this.castlibs.get(num)?.fileName ?? "";
   }
 
+  /** Declare an external cast library's identity (number, name, fileName) before its
+   *  members are loaded. The movie's DCR pre-registers every external castlib slot
+   *  with its name and `.cct` fileName; the runtime needs that declaration at startup
+   *  so Lingo `castLib(n).fileName` / `castLib(n).name` resolve and a subsequent
+   *  `preloadNetThing(castLib(n).fileName)` can drive the lazy module load. The
+   *  member table stays empty (slot inactive) until `registerCastlib` fills it. */
+  declareCastlib(num: number, name: string, fileName: string): void {
+    const existing = this.castlibs.get(num);
+    if (existing) {
+      if (existing.name === "" && name) existing.name = name;
+      if (existing.fileName === "" && fileName) existing.fileName = fileName;
+      return;
+    }
+    this.castlibs.set(num, {
+      number: num,
+      name,
+      fileName,
+      members: new Map(),
+      membersByName: new Map(),
+      scriptsByName: new Map(),
+      scriptsByCastMember: new Map(),
+      loaded: false,
+    });
+    if (this.cachedNumberOfCastlibs === null || num > this.cachedNumberOfCastlibs) {
+      this.cachedNumberOfCastlibs = num;
+    }
+  }
+
   /** Set the display name for cast library `n`. The Lingo `castLib(n).name = "foo"`
    * setter calls this. Creates an empty record if the castlib hasn't been registered
    * yet (so the castload manager's `setImportedCast` call works for any castlib
@@ -879,10 +907,17 @@ export class LingoRuntimeHost implements LingoHost {
         sprite.height = member.bakedHeight;
       }
       sprite.type = coerceSpriteType(member.type);
+      // Propagate the backing member's identity so __lsSprites() reports which
+      // cast member a (possibly Lingo-puppetted) sprite is drawing. The score
+      // path sets these in buildSprite; this covers runtime `sprite.member = X`.
+      sprite.castMemberId = member.id;
+      sprite.castMemberName = member.name || null;
       this.setSpriteLocH(sprite, oldLocH);
       this.setSpriteLocV(sprite, oldLocV);
     } else {
       sprite.bakedBitmap = null;
+      sprite.castMemberId = -1;
+      sprite.castMemberName = null;
     }
   }
 
@@ -898,6 +933,8 @@ export class LingoRuntimeHost implements LingoHost {
         const dyn = this.dynamicMembers.get(value.id);
         const image = this.dynamicMemberImages.get(value.id);
         this.spriteMemberTokens.set(sprite.channel, { id: value.id, castLib: value.castLib });
+        sprite.castMemberId = value.id;
+        sprite.castMemberName = dyn?.name || null;
         if (image instanceof LingoImage) {
           sprite.bakedBitmap = image.bitmap;
           sprite.width = image.width;
