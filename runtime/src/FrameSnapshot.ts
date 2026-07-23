@@ -47,6 +47,10 @@ export interface RenderSprite {
   hasBehaviors: boolean;
   shapeLineSize: number | null;
   shapePattern: number | null;
+  /** Director cast member number backing this sprite, or -1 if none. */
+  castMemberId: number;
+  /** Name of the backing cast member, or null if unnamed. */
+  castMemberName: string | null;
 }
 
 /** A complete frame: stage geometry + the ordered list of sprites to composite. */
@@ -94,6 +98,7 @@ export function mergeScoreSnapshot(
       "foreColor", "backColor", "hasForeColor", "hasBackColor",
       "ink", "blend", "flipH", "flipV", "rotation", "skew",
       "bakedBitmap", "hasBehaviors", "shapeLineSize", "shapePattern",
+      "castMemberId", "castMemberName",
     ] as const) {
       if (next[key] !== previous[key]) writable[key] = next[key];
     }

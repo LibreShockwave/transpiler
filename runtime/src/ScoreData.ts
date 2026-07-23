@@ -227,6 +227,8 @@ export function buildSprite(
     hasBehaviors: json.hasBehaviors ?? false,
     shapeLineSize: null,
     shapePattern: null,
+    castMemberId: json.castMemberId ?? -1,
+    castMemberName: json.castMemberName ?? null,
   };
 }
 

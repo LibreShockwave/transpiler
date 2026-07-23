@@ -136,7 +136,7 @@ describe("LingoPropList", () => {
     expect(p.get("a")).toBe(10);
     expect(p.get("b")).toBe(2);
     expect(p.has("c")).toBe(false);
-    expect(p.get("c")).toBeUndefined();
+    expect(p.get("c")).toBe(LINGO_VOID);
   });
   it("supports the Director addProp method spelling", () => {
     const p = new LingoPropList();
@@ -262,7 +262,7 @@ describe("LingoHost wiring", () => {
 
   it("me property ivars read/write via helpers", () => {
     const me = createMe(7);
-    expect(meProp(me, "locH")).toBeUndefined();
+    expect(meProp(me, "locH")).toBe(LINGO_VOID);
     setMeProp(me, "locH", 42);
     expect(meProp(me, "locH")).toBe(42);
     expect(me.spriteNum).toBe(7);

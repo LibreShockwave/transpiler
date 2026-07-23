@@ -53,6 +53,8 @@ function bitmapSprite(opts: Partial<RenderSprite> & { x: number; y: number; w: n
     hasBehaviors: opts.hasBehaviors ?? false,
     shapeLineSize: opts.shapeLineSize ?? null,
     shapePattern: opts.shapePattern ?? null,
+    castMemberId: opts.castMemberId ?? -1,
+    castMemberName: opts.castMemberName ?? null,
   };
 }
 
