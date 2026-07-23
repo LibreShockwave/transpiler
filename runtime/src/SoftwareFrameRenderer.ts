@@ -6,7 +6,7 @@
 // compositeSpecialInk is ported in Stage 3 (ADD/SUBTRACT/REVERSE/GHOST/NOT_*/...); both throw until
 // then so any path that reaches them fails loudly rather than silently producing wrong pixels.
 
-import type { FrameSnapshot } from "./FrameSnapshot.js";
+import type { FrameSnapshot, RenderSprite } from "./FrameSnapshot.js";
 import { InkMode } from "./InkMode.js";
 import { Bitmap } from "./Bitmap.js";
 import { channel } from "./argb.js";
