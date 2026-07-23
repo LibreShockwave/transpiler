@@ -12,6 +12,7 @@
 // the C++ player would play are present, decoded, and playable by name.
 
 import type { SoundMemberJson } from "./ScoreData.js";
+import type { AssetStore } from "./AssetStore.js";
 
 export interface PlayOptions {
   /** 0..1, default 1. */
@@ -37,12 +38,16 @@ export class AudioPlayer {
   private readonly ctx: AudioContext;
   private readonly sounds: readonly SoundMemberJson[];
   private readonly buffers = new Map<string, AudioBuffer>();
-  private readonly assetBase: string;
+  private readonly assetStore: AssetStore | undefined;
 
-  constructor(sounds: readonly SoundMemberJson[], ctx?: AudioContext, assetBase = "") {
+  /**
+   * @param assetStore when provided (prod), sound bytes come from the in-memory
+   *   zip store instead of per-sound `fetch`. Omit for standalone/fetch usage.
+   */
+  constructor(sounds: readonly SoundMemberJson[], ctx?: AudioContext, assetStore?: AssetStore) {
     this.ctx = ctx ?? new AudioContext();
     this.sounds = sounds;
-    this.assetBase = assetBase;
+    this.assetStore = assetStore;
   }
 
   /** The sound members this player knows about (from cast.json). */
@@ -78,12 +83,11 @@ export class AudioPlayer {
         continue;
       }
       try {
-        const url = this.assetBase + s.asset;
-        const res = await fetch(url);
-        if (!res.ok) {
-          continue;
-        }
-        const arr = await res.arrayBuffer();
+        // In prod the sound bytes are already in the in-memory zip store; in dev
+        // (or when no store was supplied) fall back to a per-sound fetch.
+        const arr = this.assetStore
+          ? (await this.assetStore.getBytes(s.asset)).slice().buffer
+          : await (await fetch(s.asset)).arrayBuffer();
         const buf = await this.ctx.decodeAudioData(arr);
         this.buffers.set(s.name, buf);
         loaded.push(s.name);

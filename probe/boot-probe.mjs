@@ -192,8 +192,6 @@ async function main() {
 
   const final = await sample();
   recordLoaded(final, Date.now());
-  await browser.close();
-  if (vite) vite.kill();
 
   // Verification.
   const order = [];
@@ -230,10 +228,40 @@ async function main() {
     milestones.logo <= milestones.fuse && milestones.fuse <= milestones.entry &&
     fuseRegistered && entryRegistered;
 
+  // On success, save a screenshot of the rendered stage canvas so the boot is
+  // verifiable visually as well as by sprite-name order. Disabled with
+  // LS_SCREENSHOT=0 ; path overridable via LS_SCREENSHOT=<path> (default
+  // probe/out/boot.png).
+  let screenshotPath = null;
+  if (passed && process.env.LS_SCREENSHOT !== "0") {
+    try {
+      const { mkdirSync } = await import("node:fs");
+      const outDir = resolve(__dirname, "out");
+      mkdirSync(outDir, { recursive: true });
+      const custom = process.env.LS_SCREENSHOT && process.env.LS_SCREENSHOT !== "1";
+      screenshotPath = custom ? process.env.LS_SCREENSHOT : resolve(outDir, "boot.png");
+      // Prefer the stage <canvas>; fall back to the full page if there is none.
+      let shot;
+      try {
+        shot = await page.locator("canvas").first().screenshot({ path: screenshotPath });
+      } catch {
+        shot = await page.screenshot({ path: screenshotPath });
+      }
+      report.screenshot = screenshotPath;
+      report.screenshotBytes = shot?.length ?? null;
+    } catch (e) {
+      report.screenshotError = String(e);
+    }
+  }
+
+  await browser.close();
+  if (vite) vite.kill();
+
   console.log("=== Boot probe result ===");
   console.log(JSON.stringify(report, null, 2));
   if (passed) {
     console.log("\nPASS: Logo -> fuse_client -> hh_entry_au (in order).");
+    if (screenshotPath) console.log("screenshot: " + screenshotPath);
     process.exit(0);
   } else {
     console.log("\nFAIL: milestone order not satisfied.");

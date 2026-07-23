@@ -2,6 +2,7 @@ import { Application, Sprite, Texture } from "pixi.js";
 
 import * as runtime from "./runtime/index.js";
 import { AudioPlayer } from "./runtime/AudioPlayer.js";
+import { AssetStore, HttpAssetStore, loadZipAssetStore } from "./runtime/AssetStore.js";
 import { decodeRgbaToBitmap } from "./runtime/RgbaAsset.js";
 import {
   buildFrameSnapshot,
@@ -61,24 +62,41 @@ async function fetchJson<T>(url: string): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-async function fetchBytes(url: string): Promise<Uint8Array> {
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`Failed to load ${url}: ${response.status}`);
-  return new Uint8Array(await response.arrayBuffer());
-}
+// Emitted script/castlib modules are discovered with import.meta.glob so that
+// Vite/Rollup see them as dynamically imported and KEEP their `ls*` exports
+// (lsLingoSource, lsScriptName, lsMembers, …). A bare `import(/* @vite-ignore */
+// \`/${file}\})` hid the usage from Rollup, which then stripped the `export`
+// keyword and left `module.lsLingoSource` undefined at runtime. Glob keys are
+// the original `/src/.../*.ts` paths in both dev and prod; the loader thunks
+// route to wherever Vite emits each chunk, so no path-preservation is needed.
+const moduleLoaders = import.meta.glob("/src/{scripts,castlib_scripts,castlibs}/**/*.ts");
+const loadModule = async (file: string): Promise<Record<string, unknown>> => {
+  const loader = moduleLoaders[`/${file}`];
+  if (!loader) throw new Error(`No emitted module for ${file} (import.meta.glob did not match)`);
+  return (await loader()) as Record<string, unknown>;
+};
 
 void (async () => {
   const manifest = await fetchJson<Manifest>("/manifest.json");
   const score = await fetchJson<ScoreJson>("/score.json");
   const cast = await fetchJson<CastJson>("/cast.json");
   const bitmaps = new Map<string, ReturnType<typeof decodeRgbaToBitmap>>();
+  // In prod all baked assets ship in a single assets.zip (built by the
+  // copyStaticData plugin) and are extracted once into an in-memory store; in
+  // dev they're loose files fetched on demand. import.meta.env.PROD is replaced
+  // at build time, so each build ships only the branch it needs.
+  const assetStore: AssetStore = import.meta.env.PROD
+    ? await loadZipAssetStore("/assets.zip")
+    : new HttpAssetStore();
   const loadBitmapAsset = async (
     asset: string | null | undefined,
     width: number | undefined,
     height: number | undefined,
   ): Promise<void> => {
     if (!asset || bitmaps.has(asset) || !width || !height) return;
-    bitmaps.set(asset, decodeRgbaToBitmap(await fetchBytes(`/${asset}`), width, height));
+    const raw = await assetStore.getBytes(asset);
+    bitmaps.set(asset, decodeRgbaToBitmap(raw, width, height));
+    assetStore.release?.(asset);
   };
 
   for (const frame of score.frames) {
@@ -109,7 +127,7 @@ void (async () => {
   }
 
   const player = new ScorePlayer(score);
-  const audio = new AudioPlayer(cast.sounds ?? []);
+  const audio = new AudioPlayer(cast.sounds ?? [], undefined, assetStore);
   const host = new LingoRuntimeHost({
     score,
     cast,
@@ -144,7 +162,7 @@ void (async () => {
   const liveSlotToTemplate = new Map<number, number>();
   const moduleLiveCastLib = new Map<ScriptModule, number>();
   for (const scriptInfo of manifest.scripts ?? []) {
-    const module = (await import(/* @vite-ignore */ `/${scriptInfo.file}`)) as ScriptModule;
+    const module = (await loadModule(scriptInfo.file)) as unknown as ScriptModule;
     scriptsByName.set(module.lsScriptName, module);
     scriptsByCastMember.set(`${module.lsCastLib}:${module.lsCastMember}`, module);
   }
@@ -170,7 +188,7 @@ void (async () => {
   // LibreShockwave C++ runtime's `DirectorFile::load` of downloaded cast bytes),
   // but the "bytes" are the transpiled TS/JS module instead of binary `.cct`.
   const registerCastlibModule = async (ref: CastlibModuleRef): Promise<void> => {
-    const module = (await import(/* @vite-ignore */ `/${ref.file}`)) as CastlibModule;
+    const module = (await loadModule(ref.file)) as unknown as CastlibModule;
     for (const member of module.lsMembers) {
       await loadBitmapAsset(member.bakedBitmapAsset, member.bakedWidth, member.bakedHeight);
     }
