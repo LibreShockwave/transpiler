@@ -88,6 +88,9 @@ export interface CastMemberJson {
   bakedBitmapAsset: string | null;
   bakedWidth: number;
   bakedHeight: number;
+  /** Authored Director registration point within the member bitmap. */
+  regX?: number;
+  regY?: number;
   /** Static text content for text/field cast members (Lingo can mutate it at runtime). */
   text?: string;
   /** Film-loop cast members only: one baked asset per internal sub-frame. */

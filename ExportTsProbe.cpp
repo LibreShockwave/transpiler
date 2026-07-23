@@ -640,6 +640,8 @@ struct CastMemberRecord {
     std::string bakedBitmapAsset; // for bitmap/film-loop/etc, if already exported
     int bakedWidth = 0;
     int bakedHeight = 0;
+    int regX = 0;
+    int regY = 0;
     std::string text; // static text content for text/field cast members
     std::vector<std::string> filmLoopFrames; // one asset per internal sub-frame
 };
@@ -724,6 +726,8 @@ void preBakeCastMemberAssets(
             cm.castLib = castLibNum;
             cm.name = memberChunk->name();
             cm.type = std::string(::libreshockwave::cast::name(memberType));
+            cm.regX = memberChunk->regPointX();
+            cm.regY = memberChunk->regPointY();
 
             // Text / Button / Shape members are not pre-baked. Their intrinsic
             // dimensions can be enormous (text members used as data buffers with
@@ -2120,6 +2124,8 @@ int main(int argc, char** argv) {
                 ts << "  bakedBitmapAsset?: string;\n";
                 ts << "  bakedWidth?: number;\n";
                 ts << "  bakedHeight?: number;\n";
+                ts << "  regX?: number;\n";
+                ts << "  regY?: number;\n";
                 ts << "}\n\n";
                 ts << "export const lsMembers: LsCastlibMember[] = [\n";
 
@@ -2182,7 +2188,9 @@ int main(int argc, char** argv) {
 
                     ts << "  { id: " << memberNumber
                        << ", name: \"" << jsonEscape(memberName) << "\""
-                       << ", type: \"" << jsonEscape(typeName) << "\"";
+                       << ", type: \"" << jsonEscape(typeName) << "\""
+                       << ", regX: " << memberChunk->regPointX()
+                       << ", regY: " << memberChunk->regPointY();
                     if (!memberText.empty()) {
                         ts << ", text: \"" << jsonEscape(memberText) << "\"";
                     }
@@ -2296,9 +2304,6 @@ int main(int argc, char** argv) {
             // real castlib.
             const std::string fname = entry.path().filename().string();
             if (fname == "empty.cct" || fname == "empty.cst") continue;
-            // This fixture is an invalid/incomplete furniture-class cast and was
-            // never part of the known-good 739-script runtime source set.
-            if (entry.path().stem() == "hh_furni_classes") continue;
             // Skip files we already covered via the snapshot (by stem so we
             // match even if the snapshot castlib's `fileName` field is stale).
             if (coveredStems.count(entry.path().stem().string())) continue;
@@ -2389,6 +2394,8 @@ int main(int argc, char** argv) {
             ts << "  bakedBitmapAsset?: string;\n";
             ts << "  bakedWidth?: number;\n";
             ts << "  bakedHeight?: number;\n";
+            ts << "  regX?: number;\n";
+            ts << "  regY?: number;\n";
             ts << "}\n\n";
             ts << "export const lsMembers: LsCastlibMember[] = [\n";
 
@@ -2430,7 +2437,9 @@ int main(int argc, char** argv) {
 
                 ts << "  { id: " << memberNumber
                    << ", name: \"" << jsonEscape(memberName) << "\""
-                   << ", type: \"" << jsonEscape(typeName) << "\"";
+                   << ", type: \"" << jsonEscape(typeName) << "\""
+                   << ", regX: " << memberChunk->regPointX()
+                   << ", regY: " << memberChunk->regPointY();
                 if (!memberText.empty()) {
                     ts << ", text: \"" << jsonEscape(memberText) << "\"";
                 }
@@ -2729,6 +2738,8 @@ int main(int argc, char** argv) {
                 cf << ", \"bakedBitmapAsset\": " << (cm.bakedBitmapAsset.empty() ? "null" : "\"" + jsonEscape(cm.bakedBitmapAsset) + "\"");
                 cf << ", \"bakedWidth\": " << cm.bakedWidth;
                 cf << ", \"bakedHeight\": " << cm.bakedHeight;
+                cf << ", \"regX\": " << cm.regX;
+                cf << ", \"regY\": " << cm.regY;
                 cf << ", \"text\": " << (cm.text.empty() ? "null" : "\"" + jsonEscape(cm.text) + "\"");
                 cf << ", \"filmLoopFrames\": [";
                 for (std::size_t f = 0; f < cm.filmLoopFrames.size(); ++f) {
