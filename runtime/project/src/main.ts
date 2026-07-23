@@ -16,7 +16,12 @@ import {
   LingoRuntimeHost,
   setLingoHost,
 } from "./runtime/index.js";
-import { setNetworkBaseUrl, setPreloadedCastFiles } from "./runtime/network.js";
+import {
+  setNetworkBaseUrl,
+  setCastlibModuleMap,
+  setCastlibRegistrar,
+  type CastlibModuleRef,
+} from "./runtime/network.js";
 
 interface Manifest {
   runtimeVersion: string;
@@ -124,11 +129,9 @@ void (async () => {
   const playerObject = host.getGlobal("_player") as unknown as {
     externalParams: { add: (key: string, value: string) => void };
   };
-  for (let index = 1; index <= 9; index += 1) {
-    const key = `sw${index}`;
-    const value = params.get(key);
-    if (value !== null) playerObject.externalParams.add(key, value);
-  }
+  // Shockwave exposes every supplied embed parameter through externalParamValue,
+  // not only the conventional sw1..sw9 configuration strings.
+  params.forEach((value, key) => playerObject.externalParams.add(key, value));
 
   if (manifest.runtimeVersion !== runtime.RUNTIME_VERSION) {
     console.warn(
@@ -138,6 +141,8 @@ void (async () => {
 
   const scriptsByName = new Map<string, ScriptModule>();
   const scriptsByCastMember = new Map<string, ScriptModule>();
+  const liveSlotToTemplate = new Map<number, number>();
+  const moduleLiveCastLib = new Map<ScriptModule, number>();
   for (const scriptInfo of manifest.scripts ?? []) {
     const module = (await import(/* @vite-ignore */ `/${scriptInfo.file}`)) as ScriptModule;
     scriptsByName.set(module.lsScriptName, module);
@@ -157,8 +162,15 @@ void (async () => {
       }
     }
   }
-  for (const castlibInfo of manifest.castlibs ?? []) {
-    const module = (await import(/* @vite-ignore */ `/${castlibInfo.file}`)) as CastlibModule;
+  // Cast libraries are loaded lazily on demand: when Lingo calls
+  // `preloadNetThing("foo.cct")`, network.ts resolves `foo` to the castlib
+  // module emitted by the exporter and invokes the registrar below, which
+  // imports the module, loads its baked bitmaps, and registers the castlib on
+  // the host. This mirrors Director's external-cast load flow (and the
+  // LibreShockwave C++ runtime's `DirectorFile::load` of downloaded cast bytes),
+  // but the "bytes" are the transpiled TS/JS module instead of binary `.cct`.
+  const registerCastlibModule = async (ref: CastlibModuleRef): Promise<void> => {
+    const module = (await import(/* @vite-ignore */ `/${ref.file}`)) as CastlibModule;
     for (const member of module.lsMembers) {
       await loadBitmapAsset(member.bakedBitmapAsset, member.bakedWidth, member.bakedHeight);
     }
@@ -176,21 +188,26 @@ void (async () => {
     );
     host.registerCastlib({
       number: module.lsCastLib,
-      name: module.lsCastLibName || castlibInfo.name,
-      fileName: castlibInfo.fileName,
+      name: module.lsCastLibName || ref.name,
+      fileName: ref.fileName,
       members,
       membersByName: new Map(module.lsMembers.map((member) => [member.name, member.id])),
       scriptsByName: new Map(module.lsScripts.map((script) => [script.name, script.castMember])),
       scriptsByCastMember: new Map(module.lsScripts.map((script) => [script.castMember, script.name])),
     });
-  }
-  setPreloadedCastFiles(
-    (manifest.castlibs ?? []).flatMap((castlib) => [
-      castlib.fileName,
-      `${castlib.name}.cct`,
-      `${castlib.name}.cst`,
-    ]),
-  );
+  };
+  const castlibRefs: CastlibModuleRef[] = (manifest.castlibs ?? []).map((castlib) => ({
+    file: castlib.file,
+    number: castlib.number,
+    name: castlib.name,
+    fileName: castlib.fileName,
+  }));
+  setCastlibModuleMap(castlibRefs);
+  setCastlibRegistrar(registerCastlibModule);
+
+  host.setCastlibImportCallback((liveSlot, _castName, templateSlot) => {
+    liveSlotToTemplate.set(liveSlot, templateSlot);
+  });
 
   interface ScriptToken {
     name: string;
@@ -210,6 +227,14 @@ void (async () => {
     if (token.castLib !== undefined && token.castMember !== undefined) {
       const exact = scriptsByCastMember.get(`${token.castLib}:${token.castMember}`);
       if (exact) return exact;
+      const templateSlot = liveSlotToTemplate.get(token.castLib);
+      if (templateSlot !== undefined) {
+        const fallback = scriptsByCastMember.get(`${templateSlot}:${token.castMember}`);
+        if (fallback) {
+          moduleLiveCastLib.set(fallback, token.castLib);
+          return fallback;
+        }
+      }
     }
     return scriptsByName.get(token.name);
   };
@@ -232,10 +257,19 @@ void (async () => {
   ): runtime.LingoValue => {
     const implementation = module.lsHandlerStubs[handlerName];
     if (!implementation) return undefined;
-    host.pushParams(args);
-    host.pushCastLib(module.lsCastLib);
+    const handler = module.lsHandlers.find((h) => h.name === handlerName);
+    const arity = handler?.args.length ?? args.length;
+    // Director passes VOID for omitted handler arguments. Pad the JavaScript
+    // argument list so generated handlers do not crash reading properties of
+    // undefined when a Lingo call omits trailing parameters.
+    const padded = args.slice();
+    while (padded.length < arity) {
+      padded.push(runtime.LINGO_VOID);
+    }
+    host.pushParams(padded);
+    host.pushCastLib(moduleLiveCastLib.get(module) ?? module.lsCastLib);
     try {
-      return implementation(me, ...args) as runtime.LingoValue;
+      return implementation(me, ...padded) as runtime.LingoValue;
     } finally {
       host.popCastLib();
       host.popParams();
