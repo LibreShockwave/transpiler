@@ -2310,9 +2310,17 @@ export class LingoImage {
       }
     }
     const bgColorRaw = optionsMap ? optionsMap.getProp(symbol("bgColor")) : undefined;
-    const bgColorRgb = bgColorRaw !== undefined && bgColorRaw !== LINGO_VOID && ink === InkMode.BACKGROUND_TRANSPARENT
-      ? parseColor(bgColorRaw) & 0x00ffffff
-      : undefined;
+    let bgColorRgb: number | undefined;
+    if (ink === InkMode.BACKGROUND_TRANSPARENT) {
+      if (bgColorRaw !== undefined && bgColorRaw !== LINGO_VOID) {
+        bgColorRgb = parseColor(bgColorRaw) & 0x00ffffff;
+      } else {
+        // Director's `#backgroundTransparent` ink keys out the sprite's background
+        // color. When no explicit `#bgColor` is supplied and the source is an
+        // opaque 32-bit bitmap, the C++ runtime defaults to white (0xFFFFFF).
+        bgColorRgb = 0xffffff;
+      }
+    }
     const from = source.bitmap.pixels();
     const to = this.bitmap.pixels();
     const maskPixels = mask ? mask.bitmap.pixels() : null;
