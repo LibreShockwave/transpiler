@@ -2317,6 +2317,7 @@ export class LingoImage {
     const maskH = mask ? mask.height : 0;
     const srcPalette = source.bitmap.imagePalette();
     const srcIndices = source.depth <= 8 ? source.bitmap.paletteIndices() : null;
+    const dstNeedsIndex = this.depth <= 8;
     for (let dy = 0; dy < dstHeight; dy += 1) {
       const ty = integer(dst[1]) + dy;
       const sy = integer(src[1]) + Math.floor(dy * srcHeight / dstHeight);
@@ -2328,7 +2329,9 @@ export class LingoImage {
         const srcOffset = sy * source.width + sx;
         let srcPixel = from[srcOffset];
         if (srcIndices !== null && srcPalette !== null) {
-          srcPixel = srcPalette.getColor(srcIndices[srcOffset] & 0xff);
+          // Palette indices describe opaque colours; the stored palette entry may carry
+          // a zero alpha channel, but the pixel itself is not transparent.
+          srcPixel = ((0xff << 24) | (srcPalette.getColor(srcIndices[srcOffset] & 0xff) & 0x00ffffff)) >>> 0;
         }
         if (bgColorRgb !== undefined && (srcPixel & 0x00ffffff) === bgColorRgb) {
           continue;
@@ -2347,6 +2350,13 @@ export class LingoImage {
         }
         to[ty * this.width + tx] = srcPixel;
       }
+    }
+    // 8-bit destinations carry parallel palette indices. Copying only the ARGB
+    // buffer leaves the indices stale, so a later palette remap would overwrite
+    // the copied pixels with the old palette colour. Quantize the written buffer
+    // to the destination palette so indices stay in sync.
+    if (dstNeedsIndex && this.bitmap.imagePalette()) {
+      this.bitmap.quantizeToImagePalette();
     }
     this.bitmap.markScriptModified();
   }

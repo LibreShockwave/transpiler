@@ -570,7 +570,10 @@ export class Bitmap {
     return ((alpha << 24) | (this.imagePalette_.getColor(index) & 0x00ffffff)) >>> 0;
   }
 
-  private quantizeToImagePalette(): number {
+  /** Quantize every non-transparent ARGB pixel to the current image palette and
+   * keep the parallel paletteIndices array in sync. Public so the generic
+   * copyPixels path can maintain index consistency on 8-bit destinations. */
+  quantizeToImagePalette(): number {
     if (this.imagePalette_ === null) {
       return 0;
     }

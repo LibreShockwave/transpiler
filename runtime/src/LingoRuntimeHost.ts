@@ -1394,8 +1394,14 @@ export class LingoRuntimeHost implements LingoHost {
           const rectHeight = memberRect instanceof LingoList
             ? Number(memberRect.getAt(4)) - Number(memberRect.getAt(2))
             : undefined;
-          const width = Math.max(1, Number(rectWidth ?? props?.get("width") ?? 1) || 1);
-          const height = Math.max(1, Number(rectHeight ?? props?.get("height") ?? 1) || 1);
+          const width = rectWidth !== undefined
+            ? rectWidth
+            : Math.max(1, Number(props?.get("width") ?? 1) || 1);
+          // A zero-height rect means the text member should auto-size to its natural line count,
+          // so pass the raw rect height through instead of clamping it to 1.
+          const height = rectHeight !== undefined
+            ? rectHeight
+            : Math.max(1, Number(props?.get("height") ?? 1) || 1);
           return this.renderTextMemberImage(dyn, width, height);
         }
         const existing = this.dynamicMemberImages.get(dyn.id);
@@ -1794,8 +1800,46 @@ export class LingoRuntimeHost implements LingoHost {
         pixels[i >> 2] = ((0xff << 24) | (data[i] << 16) | (data[i + 1] << 8) | data[i + 2]) >>> 0;
       }
     }
-    const bitmap = new (Bitmap)(canvas.width, canvas.height, 32, pixels);
-    return new LingoImage(canvas.width, canvas.height, 32, undefined, bitmap);
+    // Text members authored with an oversized rect (e.g. the Writer's 480px default)
+    // still report that rect height. Director's text image should only be as tall as
+    // the rendered glyphs, otherwise Habbo's unique/image-wrapper elements scale or
+    // crop a 480px blank area and the text disappears.
+    let firstRow = 0;
+    let lastRow = canvasHeight - 1;
+    while (firstRow < canvasHeight) {
+      let rowHasAlpha = false;
+      for (let x = 0; x < canvas.width; ++x) {
+        if ((pixels[firstRow * canvas.width + x] >>> 24) !== 0) {
+          rowHasAlpha = true;
+          break;
+        }
+      }
+      if (rowHasAlpha) break;
+      firstRow += 1;
+    }
+    while (lastRow > firstRow) {
+      let rowHasAlpha = false;
+      for (let x = 0; x < canvas.width; ++x) {
+        if ((pixels[lastRow * canvas.width + x] >>> 24) !== 0) {
+          rowHasAlpha = true;
+          break;
+        }
+      }
+      if (rowHasAlpha) break;
+      lastRow -= 1;
+    }
+    const cropHeight = lastRow - firstRow + 1;
+    let cropPixels = pixels;
+    if (cropHeight < canvasHeight) {
+      cropPixels = new Uint32Array(canvas.width * cropHeight);
+      for (let y = 0; y < cropHeight; ++y) {
+        const srcOffset = (firstRow + y) * canvas.width;
+        const dstOffset = y * canvas.width;
+        cropPixels.set(pixels.subarray(srcOffset, srcOffset + canvas.width), dstOffset);
+      }
+    }
+    const bitmap = new (Bitmap)(canvas.width, cropHeight, 32, cropPixels);
+    return new LingoImage(canvas.width, cropHeight, 32, undefined, bitmap);
   }
 
   getGlobal(name: string): LingoValue {
