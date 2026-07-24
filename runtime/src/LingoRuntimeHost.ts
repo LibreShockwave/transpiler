@@ -37,6 +37,7 @@ import {
   popScriptContext,
   currentScriptContext,
   lingoTruthy,
+  parseColor,
 } from "./lingo-runtime.js";
 import {
   getNetText,
@@ -208,6 +209,8 @@ export class LingoRuntimeHost implements LingoHost {
   private memberImages = new Map<string, LingoValue>();
   private dynamicMemberImages = new Map<number, LingoValue>();
   private readonly memberRuntimeProps = new Map<string, Map<string, LingoValue>>();
+  private textCanvas: HTMLCanvasElement | null = null;
+  private textCtx: CanvasRenderingContext2D | null = null;
   /** Secondary index: dynamic member name → dynamic member id. Populated by
    * `setMemberProp` when a downloaded cast member names itself (e.g. `tmember.name = url`).
    * This lets `field(name)` / `member(name)` resolve the same dynamic member later, so
@@ -1381,14 +1384,6 @@ export class LingoRuntimeHost implements LingoHost {
         return dyn.text;
       }
       if (lower === "image") {
-        const existing = this.dynamicMemberImages.get(dyn.id);
-        if (existing !== undefined) {
-          return existing;
-        }
-        // Text/field members do not have a baked bitmap asset, but scripts
-        // such as Common Button Class read member(...).image to build button
-        // labels. Generate a blank surface sized from the member's rect so
-        // image-based UI construction can proceed.
         if (dyn.type === "text" || dyn.type === "field") {
           const props = this.memberRuntimeProps.get(`dynamic:${dyn.id}`);
           const memberRect = props?.get("rect");
@@ -1400,11 +1395,28 @@ export class LingoRuntimeHost implements LingoHost {
             : undefined;
           const width = Math.max(1, Number(rectWidth ?? props?.get("width") ?? 1) || 1);
           const height = Math.max(1, Number(rectHeight ?? props?.get("height") ?? 1) || 1);
-          const img = new LingoImage(width, height, 32);
-          this.dynamicMemberImages.set(dyn.id, img);
-          return img;
+          return this.renderTextMemberImage(dyn, width, height);
+        }
+        const existing = this.dynamicMemberImages.get(dyn.id);
+        if (existing !== undefined) {
+          return existing;
         }
         return existing;
+      }
+      if (lower === "width" || lower === "height") {
+        const props = this.memberRuntimeProps.get(`dynamic:${dyn.id}`);
+        const memberRect = props?.get("rect");
+        if (memberRect instanceof LingoList) {
+          if (lower === "width") {
+            return Number(memberRect.getAt(3)) - Number(memberRect.getAt(1));
+          } else {
+            return Number(memberRect.getAt(4)) - Number(memberRect.getAt(2));
+          }
+        }
+        const cached = this.dynamicMemberImages.get(dyn.id);
+        if (cached instanceof LingoImage) {
+          return lower === "width" ? cached.width : cached.height;
+        }
       }
       return this.memberRuntimeProps.get(`dynamic:${dyn.id}`)?.get(lower);
     }
@@ -1620,6 +1632,117 @@ export class LingoRuntimeHost implements LingoHost {
     }
   }
 
+
+  /** Render a dynamic text/field member into a 32-bit ARGB surface using a browser
+   * canvas. This is a minimal replacement for Director's text engine: it supports
+   * font, size, style, color, alignment, word wrap and fixed line spacing, and is
+   * enough for Habbo UI labels, buttons and input fields. */
+  private renderTextMemberImage(dyn: DynamicMember, width: number, height: number): LingoImage {
+    if (typeof document === "undefined") {
+      return new LingoImage(width, height, 32);
+    }
+    if (!this.textCanvas) {
+      this.textCanvas = document.createElement("canvas");
+      this.textCtx = this.textCanvas.getContext("2d");
+    }
+    const canvas = this.textCanvas;
+    const ctx = this.textCtx;
+    if (!canvas || !ctx) {
+      return new LingoImage(width, height, 32);
+    }
+    canvas.width = Math.max(1, Math.floor(width));
+    canvas.height = Math.max(1, Math.floor(height));
+
+    const props = this.memberRuntimeProps.get(`dynamic:${dyn.id}`);
+    const text = dyn.text || "";
+    const fontSize = Math.max(1, Number(props?.get("fontsize") ?? props?.get("fontSize") ?? 12));
+    const rawFont = props?.get("font");
+    const fontFamily = typeof rawFont === "string" && rawFont.length > 0 ? rawFont : "monospace";
+    const rawStyle = props?.get("fontstyle") ?? props?.get("fontStyle");
+    const styles = new Set<string>();
+    if (rawStyle instanceof LingoList || Array.isArray(rawStyle)) {
+      const arr = rawStyle instanceof LingoList ? rawStyle.toArray() : rawStyle;
+      for (const s of arr) {
+        const name = typeof s === "object" && s && "name" in s ? (s as { name: string }).name : String(s);
+        if (name === "bold" || name === "italic") {
+          styles.add(name);
+        }
+      }
+    } else if (rawStyle) {
+      const name = typeof rawStyle === "object" && rawStyle && "name" in rawStyle ? (rawStyle as { name: string }).name : String(rawStyle);
+      if (name === "bold" || name === "italic") {
+        styles.add(name);
+      }
+    }
+    const fontStyle = styles.size > 0 ? Array.from(styles).join(" ") : "normal";
+
+    const color = parseColor(props?.get("color"));
+    const r = (color >>> 16) & 0xff;
+    const g = (color >>> 8) & 0xff;
+    const b = color & 0xff;
+
+    const rawAlignment = props?.get("alignment");
+    let textAlign: CanvasTextAlign = "left";
+    if (rawAlignment) {
+      const name = typeof rawAlignment === "object" && rawAlignment && "name" in rawAlignment ? (rawAlignment as { name: string }).name : String(rawAlignment);
+      if (name === "center") textAlign = "center";
+      else if (name === "right") textAlign = "right";
+    }
+
+    const wordWrap = lingoTruthy(props?.get("wordwrap") ?? props?.get("wordWrap") ?? false);
+    const lineHeight = Math.max(1, Number(props?.get("fixedlinespace") ?? props?.get("fixedLineSpace") ?? fontSize + 2));
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.font = `${fontStyle} ${fontSize}px ${fontFamily}, monospace`;
+    ctx.fillStyle = `rgb(${r}, ${g}, ${b})`;
+    ctx.textBaseline = "top";
+    ctx.textAlign = textAlign;
+
+    const lines: string[] = [];
+    if (wordWrap) {
+      for (const rawLine of text.split(/\r|\n/)) {
+        let current = "";
+        for (const word of rawLine.split(" ")) {
+          const test = current ? `${current} ${word}` : word;
+          if (ctx.measureText(test).width <= canvas.width) {
+            current = test;
+          } else {
+            if (current) lines.push(current);
+            current = word;
+          }
+        }
+        if (current) lines.push(current);
+      }
+    } else {
+      for (const line of text.split(/\r|\n/)) {
+        lines.push(line);
+      }
+    }
+
+    let y = 0;
+    for (const line of lines) {
+      let x = 0;
+      if (textAlign === "center") x = canvas.width / 2;
+      else if (textAlign === "right") x = canvas.width;
+      ctx.fillText(line, x, y);
+      y += lineHeight;
+      if (y > canvas.height) break;
+    }
+
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const data = imageData.data;
+    const pixels = new Uint32Array(canvas.width * canvas.height);
+    for (let i = 0; i < data.length; i += 4) {
+      const a = data[i + 3];
+      if (a === 0) {
+        pixels[i >> 2] = 0;
+      } else {
+        pixels[i >> 2] = ((a << 24) | (data[i] << 16) | (data[i + 1] << 8) | data[i + 2]) >>> 0;
+      }
+    }
+    const bitmap = new (Bitmap)(canvas.width, canvas.height, 32, pixels);
+    return new LingoImage(canvas.width, canvas.height, 32, undefined, bitmap);
+  }
 
   getGlobal(name: string): LingoValue {
     return this.state.globals.get(name);

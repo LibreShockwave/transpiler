@@ -940,6 +940,8 @@ export class LingoMemberProxy {
 
   get width(): number { return Number(this.host.getMemberProp(this.token, "width")) || 0; }
   get height(): number { return Number(this.host.getMemberProp(this.token, "height")) || 0; }
+  get rect(): LingoValue { return this.host.getMemberProp(this.token, "rect"); }
+  set rect(v: LingoValue) { this.host.setMemberProp(this.token, "rect", v); }
   get image(): LingoValue { return this.host.getMemberProp(this.token, "image"); }
   set image(v: LingoValue) { this.host.setMemberProp(this.token, "image", v); }
 
@@ -1468,6 +1470,7 @@ export function spriteWithin(_a: LingoValue, _b: LingoValue): boolean {
 
 function valueVector(value: LingoValue): LingoValue[] | null {
   if (value instanceof LingoList) return value.toArray();
+  if (value instanceof LingoPointProxy) return [value.x, value.y];
   if (Array.isArray(value)) return [...value] as LingoValue[];
   return null;
 }
@@ -2183,7 +2186,14 @@ export class LingoImage {
     const top = rectangle ? rectangle[1] : args[1];
     const right = rectangle ? rectangle[2] : args[2];
     const bottom = rectangle ? rectangle[3] : args[3];
-    const color = rectangle ? args[1] : args[4];
+    let color = rectangle ? args[1] : args[4];
+    // Director `image.fill(rect, [#color: rgb, #shape: #rect])` passes a propList.
+    if (color instanceof LingoPropList) {
+      const propColor = color.getProp(symbol("color"));
+      if (propColor !== undefined && propColor !== LINGO_VOID) {
+        color = propColor;
+      }
+    }
     const l = Math.max(0, integer(left));
     const t = Math.max(0, integer(top));
     const r = Math.min(this.width, integer(right));
@@ -2196,7 +2206,7 @@ export class LingoImage {
     this.bitmap.markScriptModified();
   }
 
-  copyPixels(source: LingoValue, destinationRect: LingoValue, sourceRect: LingoValue, _options?: LingoValue): void {
+  copyPixels(source: LingoValue, destinationRect: LingoValue, sourceRect: LingoValue, options?: LingoValue): void {
     if (!(source instanceof LingoImage)) return;
     const dst = imageRectValues(destinationRect);
     const src = imageRectValues(sourceRect);
@@ -2206,8 +2216,14 @@ export class LingoImage {
     const srcWidth = Math.max(0, integer(src[2]) - integer(src[0]));
     const srcHeight = Math.max(0, integer(src[3]) - integer(src[1]));
     if (dstWidth === 0 || dstHeight === 0 || srcWidth === 0 || srcHeight === 0) return;
+    const optionsMap = options instanceof LingoPropList ? options : null;
+    const maskImage = optionsMap ? optionsMap.getProp(symbol("maskImage")) : undefined;
+    const mask = maskImage instanceof LingoImage ? maskImage : null;
     const from = source.bitmap.pixels();
     const to = this.bitmap.pixels();
+    const maskPixels = mask ? mask.bitmap.pixels() : null;
+    const maskW = mask ? mask.width : 0;
+    const maskH = mask ? mask.height : 0;
     for (let dy = 0; dy < dstHeight; dy += 1) {
       const ty = integer(dst[1]) + dy;
       const sy = integer(src[1]) + Math.floor(dy * srcHeight / dstHeight);
@@ -2216,7 +2232,20 @@ export class LingoImage {
         const tx = integer(dst[0]) + dx;
         const sx = integer(src[0]) + Math.floor(dx * srcWidth / dstWidth);
         if (tx < 0 || tx >= this.width || sx < 0 || sx >= source.width) continue;
-        to[ty * this.width + tx] = from[sy * source.width + sx];
+        let srcPixel = from[sy * source.width + sx];
+        let srcA = (srcPixel >>> 24) & 0xff;
+        if (maskPixels && maskW > 0 && maskH > 0) {
+          const mx = Math.min(maskW - 1, Math.max(0, sx));
+          const my = Math.min(maskH - 1, Math.max(0, sy));
+          const maskPixel = maskPixels[my * maskW + mx];
+          const maskA = (maskPixel >>> 24) & 0xff;
+          if (maskA === 0) continue;
+          srcA = Math.min(255, Math.round((srcA * maskA) / 255));
+          srcPixel = ((srcA << 24) | (srcPixel & 0x00ffffff)) >>> 0;
+        } else if (srcA === 0) {
+          continue;
+        }
+        to[ty * this.width + tx] = srcPixel;
       }
     }
     this.bitmap.markScriptModified();
@@ -2232,13 +2261,33 @@ function imageRectValues(value: LingoValue): LingoValue[] | undefined {
   return undefined;
 }
 
-function imageColor(value: LingoValue): number {
+/** Parse a Lingo color value: hex string, rgb object, or numeric RGB. */
+export function parseColor(value: LingoValue): number {
   if (typeof value === "number") return (0xff000000 | (value & 0x00ffffff)) >>> 0;
   if (value && typeof value === "object" && "red" in value && "green" in value && "blue" in value) {
     const color = value as unknown as { red: number; green: number; blue: number };
     return (0xff000000 | ((color.red & 0xff) << 16) | ((color.green & 0xff) << 8) | (color.blue & 0xff)) >>> 0;
   }
+  if (typeof value === "string") {
+    const hex = value.trim();
+    // Director / Habbo layout files often pass colors as "0xRRGGBB" hex strings.
+    const m = /^(?:#|0x)?([0-9a-fA-F]{3,8})$/.exec(hex);
+    if (m) {
+      let digits = m[1];
+      if (digits.length === 3 || digits.length === 4) {
+        digits = digits.split("").map((c) => c + c).join("");
+      }
+      const n = parseInt(digits.slice(0, 6), 16);
+      if (!isNaN(n)) {
+        return (0xff000000 | n) >>> 0;
+      }
+    }
+  }
   return 0xff000000;
+}
+
+function imageColor(value: LingoValue): number {
+  return parseColor(value);
 }
 
 /** `image(width, height, depth[, palette])`. */
