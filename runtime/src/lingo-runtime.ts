@@ -14,6 +14,7 @@
 
 import { Bitmap } from "./Bitmap.js";
 import { ColorRef, PaletteIndex, Rgb } from "./ColorRef.js";
+import { InkMode } from "./InkMode.js";
 import type { Palette } from "./Palette.js";
 
 /** Thrown by emitted handler stubs and by accessors whose execution wiring has not landed. */
@@ -2288,8 +2289,25 @@ export class LingoImage {
     const optionsMap = options instanceof LingoPropList ? options : null;
     const maskImage = optionsMap ? optionsMap.getProp(symbol("maskImage")) : undefined;
     const mask = maskImage instanceof LingoImage ? maskImage : null;
+    const inkRaw = optionsMap ? optionsMap.getProp(symbol("ink")) : undefined;
+    let ink = InkMode.COPY;
+    if (inkRaw !== undefined && inkRaw !== LINGO_VOID) {
+      if (typeof inkRaw === "number") {
+        ink = inkRaw;
+      } else if (typeof inkRaw === "object" && inkRaw && "name" in inkRaw) {
+        // Lingo symbol such as #backgroundTransparent.
+        const name = String((inkRaw as { name: string }).name).toLowerCase();
+        if (name === "backgroundtransparent" || name === "bgtransparent") {
+          ink = InkMode.BACKGROUND_TRANSPARENT;
+        } else if (name === "copy") {
+          ink = InkMode.COPY;
+        }
+        // Other inks default to COPY for bgColor handling; full ink dispatch is
+        // not yet implemented here.
+      }
+    }
     const bgColorRaw = optionsMap ? optionsMap.getProp(symbol("bgColor")) : undefined;
-    const bgColorRgb = bgColorRaw !== undefined && bgColorRaw !== LINGO_VOID
+    const bgColorRgb = bgColorRaw !== undefined && bgColorRaw !== LINGO_VOID && ink === InkMode.BACKGROUND_TRANSPARENT
       ? parseColor(bgColorRaw) & 0x00ffffff
       : undefined;
     const from = source.bitmap.pixels();
