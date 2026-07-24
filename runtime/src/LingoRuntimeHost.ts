@@ -873,10 +873,25 @@ export class LingoRuntimeHost implements LingoHost {
   private regX(sprite: RenderSprite): number {
     const token = this.memberFromSprite(sprite);
     const member = this.resolveMember(token.id, token.castLib);
-    if (!member) return Math.floor(sprite.width / 2);
-    let reg = member.regX ?? 0;
-    if (member.bakedWidth > 0 && sprite.width > 0 && member.bakedWidth !== sprite.width) {
-      reg = Math.round(reg * sprite.width / member.bakedWidth);
+    let reg: number;
+    let imageWidth: number | undefined;
+    if (!member) {
+      const dynamicReg = this.dynamicMemberRegPoint(token);
+      if (dynamicReg) {
+        reg = dynamicReg.x;
+        const img = this.dynamicMemberImages.get(typeof token.id === "number" ? token.id : 0);
+        if (img instanceof LingoImage) {
+          imageWidth = img.width;
+        }
+      } else {
+        reg = Math.floor(sprite.width / 2);
+      }
+    } else {
+      reg = member.regX ?? 0;
+      imageWidth = member.bakedWidth > 0 ? member.bakedWidth : undefined;
+    }
+    if (imageWidth !== undefined && imageWidth > 0 && sprite.width > 0 && imageWidth !== sprite.width) {
+      reg = Math.round(reg * sprite.width / imageWidth);
     }
     return sprite.flipH && sprite.width > 0 ? sprite.width - reg : reg;
   }
@@ -884,12 +899,42 @@ export class LingoRuntimeHost implements LingoHost {
   private regY(sprite: RenderSprite): number {
     const token = this.memberFromSprite(sprite);
     const member = this.resolveMember(token.id, token.castLib);
-    if (!member) return Math.floor(sprite.height / 2);
-    let reg = member.regY ?? 0;
-    if (member.bakedHeight > 0 && sprite.height > 0 && member.bakedHeight !== sprite.height) {
-      reg = Math.round(reg * sprite.height / member.bakedHeight);
+    let reg: number;
+    let imageHeight: number | undefined;
+    if (!member) {
+      const dynamicReg = this.dynamicMemberRegPoint(token);
+      if (dynamicReg) {
+        reg = dynamicReg.y;
+        const img = this.dynamicMemberImages.get(typeof token.id === "number" ? token.id : 0);
+        if (img instanceof LingoImage) {
+          imageHeight = img.height;
+        }
+      } else {
+        reg = Math.floor(sprite.height / 2);
+      }
+    } else {
+      reg = member.regY ?? 0;
+      imageHeight = member.bakedHeight > 0 ? member.bakedHeight : undefined;
+    }
+    if (imageHeight !== undefined && imageHeight > 0 && sprite.height > 0 && imageHeight !== sprite.height) {
+      reg = Math.round(reg * sprite.height / imageHeight);
     }
     return sprite.flipV && sprite.height > 0 ? sprite.height - reg : reg;
+  }
+
+  private dynamicMemberRegPoint(token: MemberToken): { x: number; y: number } | null {
+    if (typeof token.id !== "number" || !this.isDynamicMemberId(token.id)) {
+      return null;
+    }
+    const props = this.memberRuntimeProps.get(`dynamic:${token.id}`);
+    const rp = props?.get("regpoint");
+    if (rp instanceof LingoList && rp.count >= 2) {
+      return { x: Number(rp.get(1)), y: Number(rp.get(2)) };
+    }
+    if (Array.isArray(rp) && rp.length >= 2) {
+      return { x: Number(rp[0]), y: Number(rp[1]) };
+    }
+    return null;
   }
 
   private spriteLocH(sprite: RenderSprite): number {

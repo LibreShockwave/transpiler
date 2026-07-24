@@ -83,7 +83,14 @@ export function renderFrame(snapshot: FrameSnapshot, stageWidth: number, stageHe
     argb.fill(bg);
   }
 
-  for (const sprite of snapshot.sprites) {
+  // Director composites sprites by ascending locZ (ties broken by channel order).
+  const sprites = [...snapshot.sprites].sort((a, b) => {
+    const az = a.locZ ?? a.channel;
+    const bz = b.locZ ?? b.channel;
+    return az - bz || a.channel - b.channel;
+  });
+
+  for (const sprite of sprites) {
     if (!sprite.visible) {
       continue;
     }
