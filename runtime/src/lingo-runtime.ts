@@ -2278,7 +2278,7 @@ export class LingoImage {
 
   copyPixels(source: LingoValue, destinationRect: LingoValue, sourceRect: LingoValue, options?: LingoValue): void {
     if (!(source instanceof LingoImage)) return;
-    const dst = imageRectValues(destinationRect);
+    const dst = imageDestRectValues(destinationRect);
     const src = imageRectValues(sourceRect);
     if (!dst || !src) return;
     const dstWidth = Math.max(0, integer(dst[2]) - integer(dst[0]));
@@ -2358,6 +2358,43 @@ export class LingoImage {
 function imageRectValues(value: LingoValue): LingoValue[] | undefined {
   if (value instanceof LingoList) return value.toArray();
   if (Array.isArray(value)) return value;
+  return undefined;
+}
+
+/**
+ * Normalise a Lingo destination rectangle. Director accepts either a 4-number rect
+ * `[left, top, right, bottom]` or a list of four points `[point(l,t), point(r,t),
+ * point(r,b), point(l,b)]`. The latter is common for slanted UI pieces (the Habbo
+ * navigator row edges are authored as quads that happen to be axis-aligned
+ * rectangles). Return a plain `[left, top, right, bottom]` array, or `undefined` if
+ * the value is not a recognised rectangle form.
+ */
+function imageDestRectValues(value: LingoValue): LingoValue[] | undefined {
+  const arr = value instanceof LingoList ? value.toArray() : Array.isArray(value) ? value : undefined;
+  if (!arr || arr.length === 0) return undefined;
+  // Plain rect: four scalar values.
+  if (arr.length === 4 && arr.every((v) => !(v instanceof LingoList) && !Array.isArray(v))) {
+    return arr;
+  }
+  // Quad: four points. For the runtime's current scope we flatten it to the
+  // bounding rect; this is sufficient for axis-aligned rectangle quads and
+  // matches C++ `imageCopyPixels` behaviour for that family.
+  if (arr.length === 4) {
+    const xs: number[] = [];
+    const ys: number[] = [];
+    for (const pt of arr) {
+      let ptArr: LingoValue[] | undefined;
+      if (pt instanceof LingoList) ptArr = pt.toArray();
+      else if (Array.isArray(pt)) ptArr = pt;
+      if (!ptArr || ptArr.length < 2) return undefined;
+      const x = float(ptArr[0]);
+      const y = float(ptArr[1]);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return undefined;
+      xs.push(x);
+      ys.push(y);
+    }
+    return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+  }
   return undefined;
 }
 
