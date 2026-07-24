@@ -1623,6 +1623,9 @@ export function _string(value: LingoValue): string {
  *  not as their printed form `"#foo"`.
  */
 function joinString(value: LingoValue): string {
+  if (value === LINGO_VOID || value === undefined) {
+    return "";
+  }
   if (isSymbol(value)) {
     return value.name;
   }
