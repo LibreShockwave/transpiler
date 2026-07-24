@@ -36,9 +36,14 @@ export class BrowserMultiuserXtra {
     try {
       const socket = new WebSocket(`${scheme}://${host}:${port}`);
       socket.binaryType = "arraybuffer";
-      socket.onopen = () => this.enqueue({
-        errorCode: 0, content: "", senderID: "System", subject: "ConnectToNetServer",
-      });
+      socket.onopen = () => {
+        // Structured handshake trace for the probe (no-op unless __lsNetLog is
+        // initialized). Reads no Lingo state, so it cannot double-invoke.
+        (globalThis as any).__lsNetLog?.push({ dir: "open", host, port, t: Date.now() });
+        this.enqueue({
+          errorCode: 0, content: "", senderID: "System", subject: "ConnectToNetServer",
+        });
+      };
       socket.onmessage = (event) => {
         const len = typeof event.data === "string" ? event.data.length : event.data.byteLength;
         let prefix = "";

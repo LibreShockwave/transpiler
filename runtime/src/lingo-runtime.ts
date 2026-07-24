@@ -420,6 +420,12 @@ export class LingoPropList {
         // Numeric indexing — Lingo treats pList[i] as the i-th value (1-based, like
         // LingoList). Director's propList supports both key lookup and index lookup;
         // the transpiler emits `pActiveTasks[i]` for the "i-th entry" form.
+        // BUT a STRING digit index `pList["7"]` is getaProp (by key), not getAt
+        // (positional). After JS coercion both reach here as the string "7". If the
+        // propList actually stores this digit string as a KEY, the Lingo intent is a
+        // key lookup — e.g. Cryptography Class `tVals["7"]` must return the value for
+        // key "7" (7), not vals[6] (6, the value for key "6"). Resolve by key first;
+        // only fall back to 1-based positional indexing when the digit is NOT a key.
         if (typeof prop === "string" && /^\d+$/.test(prop)) {
           const idx = Number(prop);
           if (idx >= 1 && idx <= target.keys.length) {
@@ -1501,7 +1507,13 @@ export function lingoBinary(
     case "add": return a + b;
     case "sub": return a - b;
     case "mul": return a * b;
-    case "div": return b === 0 ? 0 : a / b;
+    // Lingo `a div b` is integer division truncating toward zero (e.g. 7 div 2 = 3,
+    // -7 div 2 = -3), NOT float division. HugeInt15.div relies on this for quotient-digit
+    // extraction (`x div 10` strips a decimal digit); a float result leaves the digit a
+    // fraction, so the long-division outer loop never reduces the remainder and spins
+    // forever (the DH powMod freeze). Lingo `/` (float) is emitted as direct JS `/`, so
+    // this lingoBinary("div") path is exclusively the integer operator.
+    case "div": return b === 0 ? 0 : Math.trunc(a / b);
     case "mod": return b === 0 ? 0 : a % b;
     case "lt": return a < b;
     case "lte": return a <= b;
@@ -2469,7 +2481,19 @@ export const SUPPORTED_LINGO_BUILTINS = new Set([
   "nettextresult", "neterror", "getstreamstatus", "tellstreamstatus", "gotonetpage",
   "gotonetmovie", "externalparamvalue", "externalparamname", "externalparamcount",
   "image", "importfileinto", "beep", "sound", "soundenabled", "castlib", "member",
-  "field", "createmember", "xtra", "setnetbufferlimits", "setnetmessagehandler",
+  "field", "xtra", "setnetbufferlimits", "setnetmessagehandler",
+  // NOTE: "createmember" is deliberately NOT in this set. When it was, callNamed
+  // ("createMember", name, type) dispatched to the native host createMember
+  // (LingoRuntimeHost callBuiltin case), which creates the dynamic member and
+  // updates the host's dynamicMembersByName but NOT the Resource Manager's
+  // pAllMemNumList. memberExists/getmemnum are NOT in this set, so they route
+  // through globalDispatcher -> resource_api -> the Resource Manager, which
+  // reads pAllMemNumList. The two name indexes diverged, so members created via
+  // the free-function createMember (download_manager.queue for figure XMLs)
+  // were invisible to memberExists -> partSetLoaded failed -> figurepartlist
+  // .loaded stayed 0 -> initA looped -> handshake never started. Routing
+  // createMember through the manager (full bookkeeping: new() + name +
+  // pAllMemNumList + pDynMemNumList) fixes it. The native case stays as fallback.
   "connecttonetserver", "sendnetmessage", "getnetmessage", "checknetmessages",
   "getnumberwaitingnetmessages", "getneterrorstring", "return", "halt", "abort",
   "nothing", "param", "go", "call", "sendallsprites", "point", "rect", "union",

@@ -313,9 +313,14 @@ void (async () => {
     me.props.set("__scriptCastMember", module.lsCastMember);
     runtime.seedScriptProps(me, module.lsLingoSource);
     parentInstances.add(me);
-    if (module.lsHandlers.some((handler) => handler.name === "_new")) {
-      invokeInstance(module, "_new", me, args);
-    }
+    // Fire the Director `on new me` constructor. The transpiler renames the JS
+    // function to `_new` (a keyword) but keeps the Lingo handler name as "new"
+    // (both in lsHandlers and as the lsHandlerStubs key), so dispatch by the
+    // "new" event / handler name — not the JS function name. Without this, the
+    // constructor never runs and instance properties (e.g. HugeInt15 pBase/
+    // pDigits) stay VOID, which later surfaces as a RangeError in assign().
+    const newHandler = module.lsHandlers.find((h) => h.event === "new" || h.name === "new");
+    if (newHandler) invokeInstance(module, newHandler.name, me, args);
     return me;
   });
   host.setInstanceDispatcher((_scriptName, handlerName, me, args) => {
