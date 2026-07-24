@@ -759,7 +759,13 @@ export function lingoString(value: LingoValue): string {
     if (value.length === 0) {
       return "[:]";
     }
-    return "[:]";
+    const parts: string[] = [];
+    for (let i = 1; i <= value.length; ++i) {
+      const key = value.getPropAt(i);
+      const keyStr = isSymbol(key) ? `#${key.name}` : lingoString(key);
+      parts.push(`${keyStr}: ${lingoString(value.getAt(i))}`);
+    }
+    return `[${parts.join(", ")}]`;
   }
   return String(value);
 }
@@ -3161,6 +3167,31 @@ function parseColorTriple(text: string): LingoValue {
 }
 
 /**
+ * Returns the index of a trailing `#` comment marker in a value string, or -1 if none.
+ * Comment markers inside quoted strings or bracketed list/propList literals are ignored,
+ * so values like `[#font:"Courier", #ilk:#struct]` survive parsing intact.
+ */
+function findTrailingCommentIndex(s: string): number {
+  let inQuotes = false;
+  let bracketDepth = 0;
+  for (let i = 0; i < s.length; ++i) {
+    const ch = s[i];
+    if (ch === '"' && (i === 0 || s[i - 1] !== '\\')) {
+      inQuotes = !inQuotes;
+    } else if (!inQuotes) {
+      if (ch === '[') {
+        bracketDepth++;
+      } else if (ch === ']') {
+        bracketDepth--;
+      } else if (ch === '#' && bracketDepth <= 0) {
+        return i;
+      }
+    }
+  }
+  return -1;
+}
+
+/**
  * `convertToPropList(text, delimiter)` — parse `key=value` lines (or items split by
  * `delimiter`) into a propList. This is the Habbo external-variables/props loader path,
  * so it also recognises `rgb(r,g,b)` values and list literals `[...]`.
@@ -3180,8 +3211,10 @@ export function convertToPropList(text: LingoValue, delimiter: LingoValue): Ling
     }
     const key = trimmed.slice(0, eq).trim();
     let raw = trimmed.slice(eq + 1).trim();
-    // Strip trailing comments.
-    const comment = raw.indexOf("#");
+    // Strip trailing comments, but only `#` markers that are outside bracketed literals
+    // or quoted strings. Habbo stores `#symbol` markers inside `struct.font.*` propLists,
+    // so a naive indexOf("#") truncates those values to just "[".
+    const comment = findTrailingCommentIndex(raw);
     if (comment >= 0) {
       raw = raw.slice(0, comment).trim();
     }

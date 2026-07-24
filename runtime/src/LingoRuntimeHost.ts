@@ -1699,7 +1699,15 @@ export class LingoRuntimeHost implements LingoHost {
     const text = dyn.text || "";
     const fontSize = Math.max(1, Number(props?.get("fontsize") ?? props?.get("fontSize") ?? 12));
     const rawFont = props?.get("font");
-    const fontFamily = typeof rawFont === "string" && rawFont.length > 0 ? rawFont : "monospace";
+    const fontMap: Record<string, string> = {
+      v: "Verdana, sans-serif",
+      V: "Verdana, sans-serif",
+      vb: "Verdana, sans-serif",
+      VB: "Verdana, sans-serif",
+    };
+    const fontFamily = typeof rawFont === "string" && rawFont.length > 0
+      ? (fontMap[rawFont] ?? rawFont)
+      : "monospace";
     const rawStyle = props?.get("fontstyle") ?? props?.get("fontStyle");
     const styles = new Set<string>();
     if (rawStyle instanceof LingoList || Array.isArray(rawStyle)) {
