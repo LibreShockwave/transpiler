@@ -95,6 +95,8 @@ export interface CastMemberJson {
   text?: string;
   /** Film-loop cast members only: one baked asset per internal sub-frame. */
   filmLoopFrames?: string[];
+  /** Palette cast members only: 256 ARGB color entries. */
+  paletteColors?: number[];
 }
 
 /** cast.json shape (Stage 6: sound members; other cast metadata is enriched in later stages). */

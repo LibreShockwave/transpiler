@@ -6,6 +6,7 @@
 // LingoNotImplemented so failures are loud rather than silently wrong.
 
 import type { Bitmap } from "./Bitmap.js";
+import { Palette } from "./Palette.js";
 import { buildSprite, coerceSpriteType, type BitmapLoader, type ScoreJson, type ScoreSpriteJson } from "./ScoreData.js";
 import { inkModeFromCode } from "./InkMode.js";
 import type { FrameSnapshot, RenderSprite } from "./FrameSnapshot.js";
@@ -1509,6 +1510,20 @@ export class LingoRuntimeHost implements LingoHost {
     }
     const key = this.memberCacheKey(resolved, member as MemberToken);
     return key ? this.memberRuntimeProps.get(key)?.get(lower) : undefined;
+  }
+
+  getMemberPalette(member: LingoValue): Palette | null {
+    if (member instanceof LingoMemberProxy) {
+      return this.getMemberPalette(member.token);
+    }
+    if (!isMemberToken(member)) {
+      return null;
+    }
+    const resolved = this.resolveMember(member.id, member.castLib);
+    if (!resolved || resolved.type !== "palette" || !resolved.paletteColors) {
+      return null;
+    }
+    return new Palette(resolved.paletteColors, resolved.name);
   }
 
   getScriptMemberInfo(

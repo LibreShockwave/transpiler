@@ -13,6 +13,8 @@
 // TS source backed by this shim, not interpreted.
 
 import { Bitmap } from "./Bitmap.js";
+import { ColorRef, PaletteIndex, Rgb } from "./ColorRef.js";
+import type { Palette } from "./Palette.js";
 
 /** Thrown by emitted handler stubs and by accessors whose execution wiring has not landed. */
 export class LingoNotImplemented extends Error {
@@ -165,8 +167,8 @@ export class LingoList {
           // Director point/rect values are list-like, but also expose named
           // coordinate and extent properties. `rect.width` is right-left and
           // `rect.height` is bottom-top (not the raw third/fourth entries).
-          if (prop === "x" || prop === "left") return target.items[0] ?? 0;
-          if (prop === "y" || prop === "top") return target.items[1] ?? 0;
+          if (prop === "x" || prop === "left" || prop === "loch" || prop === "locH") return target.items[0] ?? 0;
+          if (prop === "y" || prop === "top" || prop === "locv" || prop === "locV") return target.items[1] ?? 0;
           if (prop === "right") return target.items[2] ?? 0;
           if (prop === "bottom") return target.items[3] ?? 0;
           if (prop === "width" && target.items.length >= 4) {
@@ -792,6 +794,8 @@ export interface LingoHost {
   getMemberProp(member: LingoValue, prop: string): LingoValue;
   /** Write a property of a member token. */
   setMemberProp(member: LingoValue, prop: string, value: LingoValue): void;
+  /** Resolve a palette member to a runtime Palette, or null. */
+  getMemberPalette(member: LingoValue): import("./Palette.js").Palette | null;
   /** Read a global variable. */
   getGlobal(name: string): LingoValue;
   /** Write a global variable. */
@@ -922,7 +926,50 @@ export class LingoMemberProxy {
   constructor(
     public readonly token: LingoValue,
     public readonly host: LingoHost,
-  ) {}
+  ) {
+    return new Proxy(this, {
+      get(target, prop) {
+        if (typeof prop === "symbol") {
+          if (prop === Symbol.toPrimitive || prop === "toString" || prop === "valueOf") {
+            return () => lingoString(target);
+          }
+          if (prop === Symbol.iterator) {
+            return undefined;
+          }
+          return undefined;
+        }
+        if (prop === "ilk") {
+          return symbol("member");
+        }
+        // Prefer the class's declared getters/methods (name, width, rect, char...).
+        if (prop in target) {
+          const value = (target as unknown as Record<string, unknown>)[prop];
+          if (typeof value === "function") {
+            return (value as (...args: unknown[]) => unknown).bind(target);
+          }
+          return value;
+        }
+        // Dynamic Director member properties (font, fontSize, color, alignment, ...)
+        // are stored by the host and must be readable on the proxy.
+        return target.host.getMemberProp(target.token, prop);
+      },
+      set(target, prop, value) {
+        if (typeof prop !== "string") {
+          return false;
+        }
+        const descriptor = Object.getOwnPropertyDescriptor(
+          (target as unknown as Record<string, unknown>),
+          prop,
+        );
+        if (descriptor && descriptor.set) {
+          descriptor.set.call(target, value);
+          return true;
+        }
+        target.host.setMemberProp(target.token, prop, value as LingoValue);
+        return true;
+      },
+    }) as unknown as LingoMemberProxy;
+  }
 
   get name(): string {
     const v = this.host.getMemberProp(this.token, "name");
@@ -2133,9 +2180,9 @@ export function sort(list: LingoValue): void {
   }
 }
 
-/** `paletteIndex(n)` — stub; returns the index unchanged. */
+/** `paletteIndex(n)` — returns a ColorRef that renders through the target image's palette. */
 export function paletteIndex(value: LingoValue): LingoValue {
-  return value;
+  return new ColorRef(new PaletteIndex(integer(value)));
 }
 
 /** `rect(left, top, right, bottom)` — Director's 1-based rectangle value. */
@@ -2176,7 +2223,7 @@ export class LingoImage {
     const px = integer(x);
     const py = integer(y);
     if (px < 0 || py < 0 || px >= this.width || py >= this.height) return;
-    this.bitmap.pixels()[py * this.width + px] = imageColor(color);
+    this.bitmap.pixels()[py * this.width + px] = imageColor(color, this.bitmap.imagePalette());
     this.bitmap.markScriptModified();
   }
 
@@ -2198,10 +2245,32 @@ export class LingoImage {
     const t = Math.max(0, integer(top));
     const r = Math.min(this.width, integer(right));
     const b = Math.min(this.height, integer(bottom));
-    const pixel = imageColor(color);
-    const pixels = this.bitmap.pixels();
-    for (let y = t; y < b; y += 1) {
-      pixels.fill(pixel, y * this.width + l, y * this.width + r);
+    const palette = this.bitmap.imagePalette();
+    let exactIndex: number | undefined;
+    if (color instanceof ColorRef && color.isPaletteIndex() && this.depth <= 8 && palette) {
+      exactIndex = color.toNearestPaletteIndex(palette);
+    }
+    if (exactIndex !== undefined) {
+      const pixel = (0xff000000 | palette!.getColor(exactIndex)) >>> 0;
+      const pixels = this.bitmap.pixels();
+      for (let y = t; y < b; y += 1) {
+        const start = y * this.width + l;
+        pixels.fill(pixel, start, start + (r - l));
+      }
+      let indices = this.bitmap.paletteIndices();
+      if (indices === null || indices.length !== pixels.length) {
+        indices = new Uint8Array(pixels.length);
+        this.bitmap.setPaletteIndices(indices);
+      }
+      for (let y = t; y < b; y += 1) {
+        const start = y * this.width + l;
+        for (let x = 0; x < r - l; x += 1) {
+          indices[start + x] = exactIndex;
+        }
+      }
+    } else {
+      const pixel = imageColor(color, palette);
+      this.bitmap.fillRect(l, t, r - l, b - t, pixel);
     }
     this.bitmap.markScriptModified();
   }
@@ -2219,11 +2288,17 @@ export class LingoImage {
     const optionsMap = options instanceof LingoPropList ? options : null;
     const maskImage = optionsMap ? optionsMap.getProp(symbol("maskImage")) : undefined;
     const mask = maskImage instanceof LingoImage ? maskImage : null;
+    const bgColorRaw = optionsMap ? optionsMap.getProp(symbol("bgColor")) : undefined;
+    const bgColorRgb = bgColorRaw !== undefined && bgColorRaw !== LINGO_VOID
+      ? parseColor(bgColorRaw) & 0x00ffffff
+      : undefined;
     const from = source.bitmap.pixels();
     const to = this.bitmap.pixels();
     const maskPixels = mask ? mask.bitmap.pixels() : null;
     const maskW = mask ? mask.width : 0;
     const maskH = mask ? mask.height : 0;
+    const srcPalette = source.bitmap.imagePalette();
+    const srcIndices = source.depth <= 8 ? source.bitmap.paletteIndices() : null;
     for (let dy = 0; dy < dstHeight; dy += 1) {
       const ty = integer(dst[1]) + dy;
       const sy = integer(src[1]) + Math.floor(dy * srcHeight / dstHeight);
@@ -2232,7 +2307,14 @@ export class LingoImage {
         const tx = integer(dst[0]) + dx;
         const sx = integer(src[0]) + Math.floor(dx * srcWidth / dstWidth);
         if (tx < 0 || tx >= this.width || sx < 0 || sx >= source.width) continue;
-        let srcPixel = from[sy * source.width + sx];
+        const srcOffset = sy * source.width + sx;
+        let srcPixel = from[srcOffset];
+        if (srcIndices !== null && srcPalette !== null) {
+          srcPixel = srcPalette.getColor(srcIndices[srcOffset] & 0xff);
+        }
+        if (bgColorRgb !== undefined && (srcPixel & 0x00ffffff) === bgColorRgb) {
+          continue;
+        }
         let srcA = (srcPixel >>> 24) & 0xff;
         if (maskPixels && maskW > 0 && maskH > 0) {
           const mx = Math.min(maskW - 1, Math.max(0, sx));
@@ -2261,8 +2343,18 @@ function imageRectValues(value: LingoValue): LingoValue[] | undefined {
   return undefined;
 }
 
-/** Parse a Lingo color value: hex string, rgb object, or numeric RGB. */
-export function parseColor(value: LingoValue): number {
+/** Parse a Lingo color value: hex string, rgb object, ColorRef, or numeric RGB. */
+export function parseColor(value: LingoValue, palette?: Palette | null): number {
+  if (value instanceof ColorRef) {
+    if (value.isRgb()) {
+      return (0xff000000 | value.toRgb().toPacked()) >>> 0;
+    }
+    if (palette) {
+      const rgb = value.toRgb(palette);
+      return (0xff000000 | rgb.toPacked()) >>> 0;
+    }
+    return 0xff000000;
+  }
   if (typeof value === "number") return (0xff000000 | (value & 0x00ffffff)) >>> 0;
   if (value && typeof value === "object" && "red" in value && "green" in value && "blue" in value) {
     const color = value as unknown as { red: number; green: number; blue: number };
@@ -2286,8 +2378,8 @@ export function parseColor(value: LingoValue): number {
   return 0xff000000;
 }
 
-function imageColor(value: LingoValue): number {
-  return parseColor(value);
+function imageColor(value: LingoValue, palette?: Palette | null): number {
+  return parseColor(value, palette);
 }
 
 /** `image(width, height, depth[, palette])`. */
@@ -2297,7 +2389,15 @@ export function image(
   depth: LingoValue,
   paletteRef?: LingoValue,
 ): LingoImage {
-  return new LingoImage(integer(width), integer(height), integer(depth), paletteRef);
+  const surface = new LingoImage(integer(width), integer(height), integer(depth), paletteRef);
+  const host = getLingoHost();
+  if (host && paletteRef) {
+    const palette = host.getMemberPalette(paletteRef);
+    if (palette) {
+      surface.bitmap.setImagePalette(palette);
+    }
+  }
+  return surface;
 }
 
 /** `ilk(value)` — return a symbol describing the Lingo type of a value. */
@@ -2321,6 +2421,10 @@ export function ilk(value: LingoValue, expectedType?: LingoValue): LingoSymbol |
     typeName = "sprite";
   } else if (value instanceof LingoMemberProxy) {
     typeName = "member";
+  } else if (value instanceof LingoImage) {
+    typeName = "image";
+  } else if (value instanceof LingoPointProxy) {
+    typeName = "point";
   } else if (typeof value === "object") {
     typeName = "instance";
   } else {
