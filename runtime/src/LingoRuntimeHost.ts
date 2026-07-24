@@ -1612,6 +1612,7 @@ export class LingoRuntimeHost implements LingoHost {
           this.memberRuntimeProps.set(`dynamic:${dyn.id}`, props);
         }
         props.set(lower, value);
+        this.aliasMemberProp(props, lower);
       }
       return;
     }
@@ -1644,6 +1645,26 @@ export class LingoRuntimeHost implements LingoHost {
         this.memberRuntimeProps.set(key, props);
       }
       props.set(lower, value);
+      this.aliasMemberProp(props, lower);
+    }
+  }
+
+  /** Mirror common Director text-member property aliases so that layout files
+   * authored with `#txtColor` / `#txtBGColor` are readable as `.color` and
+   * `.bgColor` (and vice-versa). */
+  private aliasMemberProp(props: Map<string, LingoValue>, key: string): void {
+    const aliases: Record<string, string> = {
+      color: "txtcolor",
+      txtcolor: "color",
+      bgcolor: "txtbgcolor",
+      txtbgcolor: "bgcolor",
+    };
+    const other = aliases[key];
+    if (other) {
+      const value = props.get(key);
+      if (value !== undefined) {
+        props.set(other, value);
+      }
     }
   }
 
@@ -1665,8 +1686,8 @@ export class LingoRuntimeHost implements LingoHost {
     if (!canvas || !ctx) {
       return new LingoImage(width, height, 32);
     }
-    canvas.width = Math.max(1, Math.floor(width));
-    canvas.height = Math.max(1, Math.floor(height));
+    const canvasWidth = Math.max(1, Math.floor(width));
+    let canvasHeight = Math.max(1, Math.floor(height));
 
     const props = this.memberRuntimeProps.get(`dynamic:${dyn.id}`);
     const text = dyn.text || "";
@@ -1691,7 +1712,7 @@ export class LingoRuntimeHost implements LingoHost {
     }
     const fontStyle = styles.size > 0 ? Array.from(styles).join(" ") : "normal";
 
-    const color = parseColor(props?.get("color"));
+    const color = parseColor(props?.get("color") ?? props?.get("txtcolor"));
     const r = (color >>> 16) & 0xff;
     const g = (color >>> 8) & 0xff;
     const b = color & 0xff;
@@ -1707,11 +1728,11 @@ export class LingoRuntimeHost implements LingoHost {
     const wordWrap = lingoTruthy(props?.get("wordwrap") ?? props?.get("wordWrap") ?? false);
     const lineHeight = Math.max(1, Number(props?.get("fixedlinespace") ?? props?.get("fixedLineSpace") ?? fontSize + 2));
 
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    // Measure text using a 1px-high canvas; resizing the canvas resets the context, so the
+    // real font/state will be set again below once the final height is known.
+    canvas.width = canvasWidth;
+    canvas.height = 1;
     ctx.font = `${fontStyle} ${fontSize}px ${fontFamily}, monospace`;
-    ctx.fillStyle = `rgb(${r}, ${g}, ${b})`;
-    ctx.textBaseline = "top";
-    ctx.textAlign = textAlign;
 
     const lines: string[] = [];
     if (wordWrap) {
@@ -1719,7 +1740,7 @@ export class LingoRuntimeHost implements LingoHost {
         let current = "";
         for (const word of rawLine.split(" ")) {
           const test = current ? `${current} ${word}` : word;
-          if (ctx.measureText(test).width <= canvas.width) {
+          if (ctx.measureText(test).width <= canvasWidth) {
             current = test;
           } else {
             if (current) lines.push(current);
@@ -1733,6 +1754,20 @@ export class LingoRuntimeHost implements LingoHost {
         lines.push(line);
       }
     }
+
+    // Director text members authored with a zero-height rect auto-size to the text's
+    // natural line count (common for multi-line Writer descriptions).
+    if (height <= 0) {
+      canvasHeight = Math.max(1, Math.ceil(lines.length * lineHeight));
+    }
+
+    canvas.width = canvasWidth;
+    canvas.height = canvasHeight;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.font = `${fontStyle} ${fontSize}px ${fontFamily}, monospace`;
+    ctx.fillStyle = `rgb(${r}, ${g}, ${b})`;
+    ctx.textBaseline = "top";
+    ctx.textAlign = textAlign;
 
     let y = 0;
     for (const line of lines) {
@@ -1752,7 +1787,11 @@ export class LingoRuntimeHost implements LingoHost {
       if (a === 0) {
         pixels[i >> 2] = 0;
       } else {
-        pixels[i >> 2] = ((a << 24) | (data[i] << 16) | (data[i + 1] << 8) | data[i + 2]) >>> 0;
+        // Director's small-pixel Habbo fonts are expected to render as opaque glyphs,
+        // so threshold anti-aliased canvas edges to full alpha. RGB already carries the
+        // intended ink colour; leaving partial alpha makes 9px text disappear against
+        // similarly-coloured UI backgrounds.
+        pixels[i >> 2] = ((0xff << 24) | (data[i] << 16) | (data[i + 1] << 8) | data[i + 2]) >>> 0;
       }
     }
     const bitmap = new (Bitmap)(canvas.width, canvas.height, 32, pixels);
