@@ -22,7 +22,7 @@ const exportDir = resolve(__dirname, "..");
 const PARAMS = new URLSearchParams({
   sw1: "client.allow.cross.domain=1;client.notify.cross.domain=0",
   sw2: "connection.info.host=verysecret.classichabbo.com;connection.info.port=30100",
-  sw3: "connection.info.mus.host=verysecret.classichabbo.com;connection.info.mus.port=38201",
+  sw3: "connection.mus.host=verysecret.classichabbo.com;connection.mus.port=38201",
   sw4: "site.url=http://127.0.0.1;url.prefix=http://127.0.0.1",
   sw5: "client.reload.url=http://127.0.0.1/client/beta?x=reauthenticate;client.fatal.error.url=http://127.0.0.1/clientutils?key=error",
   sw6: "client.connection.failed.url=http://127.0.0.1/clientutils?key=connection_failed;external.variables.txt=http://127.0.0.1/gamedata/external_variables.txt?",
