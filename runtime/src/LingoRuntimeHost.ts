@@ -474,6 +474,25 @@ export class LingoRuntimeHost implements LingoHost {
   private castLibStack: number[] = [];
   private pendingExplicitCastLib: number | null = null;
 
+  // Stack of the script instances whose handlers are currently executing.
+  // A bare Lingo call (no `me.` prefix) inside a Parent/Behavior script
+  // resolves to a sibling handler in the currently-executing script; the
+  // transpiler emits such calls as `callNamed` with no `me` argument, so the
+  // runtime consults this stack to find the live instance to dispatch against.
+  private instanceStack: LingoMe[] = [];
+
+  pushInstance(me: LingoMe): void {
+    this.instanceStack.push(me);
+  }
+
+  popInstance(): void {
+    this.instanceStack.pop();
+  }
+
+  currentInstance(): LingoMe | undefined {
+    return this.instanceStack[this.instanceStack.length - 1];
+  }
+
   pushParams(args: LingoValue[]): void {
     this.paramsStack.push(args);
   }
@@ -1817,6 +1836,28 @@ export class LingoRuntimeHost implements LingoHost {
                 result.markAsStruct();
               }
               return result;
+            }
+          }
+          // Bare call to a name that is neither a builtin nor a MovieScript
+          // handler. In Lingo, a bare handler reference inside a Parent or
+          // Behavior script resolves to a sibling handler in the currently-
+          // executing script (the same instance). The transpiler emits these
+          // calls as `callNamed` (no `me.` prefix, no `me` argument), so walk
+          // the current instance's ancestor chain and dispatch via `callMethod`
+          // with the live `me` — `instanceDispatcher` re-injects `me` as the
+          // handler's first parameter, matching the emitted handler arity.
+          const current = this.currentInstance();
+          if (current && typeof current === "object" && "props" in current) {
+            let layer: LingoValue = current;
+            const visited = new Set<LingoMe>();
+            while (layer && typeof layer === "object" && "props" in layer) {
+              const inst = layer as LingoMe;
+              if (visited.has(inst)) break;
+              visited.add(inst);
+              if (this.instanceHandlerChecker?.(inst, handlerName)) {
+                return this.callBuiltin("callMethod", [handlerName, current, ...handlerArgs]);
+              }
+              layer = inst.props.get("ancestor");
             }
           }
           return this.callBuiltin(handlerName, handlerArgs);

@@ -294,9 +294,11 @@ void (async () => {
     }
     host.pushParams(padded);
     host.pushCastLib(moduleLiveCastLib.get(module) ?? module.lsCastLib);
+    host.pushInstance(me);
     try {
       return implementation(me, ...padded) as runtime.LingoValue;
     } finally {
+      host.popInstance();
       host.popCastLib();
       host.popParams();
     }
