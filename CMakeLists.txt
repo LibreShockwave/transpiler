@@ -15,6 +15,7 @@ target_link_libraries(libreshockwave_export_ts PRIVATE LibreShockwave::libreshoc
 target_compile_features(libreshockwave_export_ts PRIVATE cxx_std_20)
 target_compile_definitions(libreshockwave_export_ts PRIVATE
     LIBRESHOCKWAVE_TS_RUNTIME_DIR="${CMAKE_CURRENT_SOURCE_DIR}/runtime"
+    LIBRESHOCKWAVE_FONT_RESOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/external/LibreShockwave/cpp/resources/fonts"
 )
 set_target_properties(libreshockwave_export_ts PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")

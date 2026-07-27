@@ -39,6 +39,7 @@ import {
   currentScriptContext,
   lingoTruthy,
   parseColor,
+  rect,
 } from "./lingo-runtime.js";
 import {
   getNetText,
@@ -302,6 +303,18 @@ export class LingoRuntimeHost implements LingoHost {
     }
   }
 
+  /** Cache a downloaded cast module without occupying its eventual live movie slot. */
+  registerCastlibTemplate(record: Omit<CastlibRecord, "loaded">): void {
+    const full: CastlibRecord = { ...record, loaded: true };
+    this.castlibTemplates.set(record.name.toLowerCase(), {
+      ...full,
+      members: new Map(full.members),
+      membersByName: new Map(full.membersByName),
+      scriptsByName: new Map(full.scriptsByName),
+      scriptsByCastMember: new Map(full.scriptsByCastMember),
+    });
+  }
+
   /** Look up a registered cast library by number. Returns null if no such castlib. */
   getCastlib(num: number): CastlibRecord | null {
     return this.castlibs.get(num) ?? null;
@@ -360,7 +373,21 @@ export class LingoRuntimeHost implements LingoHost {
   setCastlibName(num: number, name: string): void {
     const existing = this.castlibs.get(num);
     const isPlaceholderName = /^empty\s+/i.test(name);
-    const source = this.castlibTemplates.get(name.toLowerCase()) ?? [...this.castlibs.values()].find(
+    const templateKeyFromFileName = (fileName: string): string => {
+      const withoutQuery = fileName.split(/[?#]/, 1)[0] ?? "";
+      const normalized = withoutQuery.replace(/\\/g, "/");
+      const baseName = normalized.slice(normalized.lastIndexOf("/") + 1);
+      return baseName.replace(/\.(?:cct|cst|dcr|dir|dxr)$/i, "").toLowerCase();
+    };
+    // Director attaches the bytes requested through castLib(n).fileName to that
+    // physical slot; the subsequent display name is not required to equal the
+    // downloaded file's basename. Security casts notably use the full
+    // tokenized URL as their cast name. Prefer name matching, then identify the
+    // downloaded template from the filename that was assigned immediately
+    // before this setter.
+    const source = this.castlibTemplates.get(name.toLowerCase())
+      ?? (existing ? this.castlibTemplates.get(templateKeyFromFileName(existing.fileName)) : undefined)
+      ?? [...this.castlibs.values()].find(
       (candidate) => candidate.number !== num && candidate.name.toLowerCase() === name.toLowerCase(),
     );
     if (existing) {
@@ -703,12 +730,20 @@ export class LingoRuntimeHost implements LingoHost {
         return sprite.width;
       case "height":
         return sprite.height;
+      case "left":
+        return sprite.x;
+      case "top":
+        return sprite.y;
+      case "right":
+        return sprite.x + sprite.width;
+      case "bottom":
+        return sprite.y + sprite.height;
       case "rect":
         return new LingoList([
-          this.spriteLocH(sprite),
-          this.spriteLocV(sprite),
-          this.spriteLocH(sprite) + sprite.width,
-          this.spriteLocV(sprite) + sprite.height,
+          sprite.x,
+          sprite.y,
+          sprite.x + sprite.width,
+          sprite.y + sprite.height,
         ]);
       case "visible":
         return sprite.visible;
@@ -782,10 +817,18 @@ export class LingoRuntimeHost implements LingoHost {
         sprite.locZ = num(value);
         break;
       case "width":
-        sprite.width = num(value);
+        {
+          const locH = this.spriteLocH(sprite);
+          sprite.width = num(value);
+          this.setSpriteLocH(sprite, locH);
+        }
         break;
       case "height":
-        sprite.height = num(value);
+        {
+          const locV = this.spriteLocV(sprite);
+          sprite.height = num(value);
+          this.setSpriteLocV(sprite, locV);
+        }
         break;
       case "rect": {
         const values = value instanceof LingoList
@@ -794,10 +837,10 @@ export class LingoRuntimeHost implements LingoHost {
         if (values.length >= 4) {
           const left = num(values[0]);
           const top = num(values[1]);
-          this.setSpriteLocH(sprite, left);
-          this.setSpriteLocV(sprite, top);
           sprite.width = num(values[2]) - left;
           sprite.height = num(values[3]) - top;
+          this.setSpriteLocH(sprite, left);
+          this.setSpriteLocV(sprite, top);
         }
         break;
       }
@@ -975,6 +1018,11 @@ export class LingoRuntimeHost implements LingoHost {
         sprite.height = member.bakedHeight;
       }
       sprite.type = coerceSpriteType(member.type);
+      sprite.shapeType = member.shapeType ?? null;
+      sprite.shapeFilled = member.shapeFilled ?? null;
+      sprite.shapeLineSize = member.shapeLineSize ?? null;
+      sprite.shapePattern = member.shapePattern ?? null;
+      sprite.shapeLineDirection = member.shapeLineDirection ?? null;
       // Propagate the backing member's identity so __lsSprites() reports which
       // cast member a (possibly Lingo-puppetted) sprite is drawing. The score
       // path sets these in buildSprite; this covers runtime `sprite.member = X`.
@@ -1384,6 +1432,18 @@ export class LingoRuntimeHost implements LingoHost {
       if (lower === "text" || lower === "htmltext") {
         return dyn.text;
       }
+      if (lower === "rect" && (dyn.type === "text" || dyn.type === "field")) {
+        const props = this.memberRuntimeProps.get(`dynamic:${dyn.id}`);
+        const memberRect = props?.get("rect");
+        if (memberRect instanceof LingoList) {
+          const left = Number(memberRect.getAt(1));
+          const top = Number(memberRect.getAt(2));
+          const right = Number(memberRect.getAt(3));
+          const bottom = Number(memberRect.getAt(4));
+          const rendered = this.renderTextMemberImage(dyn, right - left, bottom - top);
+          return rect(left, top, right, top + rendered.height);
+        }
+      }
       if (lower === "image") {
         if (dyn.type === "text" || dyn.type === "field") {
           const props = this.memberRuntimeProps.get(`dynamic:${dyn.id}`);
@@ -1417,6 +1477,11 @@ export class LingoRuntimeHost implements LingoHost {
           if (lower === "width") {
             return Number(memberRect.getAt(3)) - Number(memberRect.getAt(1));
           } else {
+            if (dyn.type === "text" || dyn.type === "field") {
+              const width = Number(memberRect.getAt(3)) - Number(memberRect.getAt(1));
+              const height = Number(memberRect.getAt(4)) - Number(memberRect.getAt(2));
+              return this.renderTextMemberImage(dyn, width, height).height;
+            }
             return Number(memberRect.getAt(4)) - Number(memberRect.getAt(2));
           }
         }
@@ -1424,6 +1489,10 @@ export class LingoRuntimeHost implements LingoHost {
         if (cached instanceof LingoImage) {
           return lower === "width" ? cached.width : cached.height;
         }
+      }
+      if (lower === "regpoint") {
+        const props = this.memberRuntimeProps.get(`dynamic:${dyn.id}`);
+        return props?.get("regpoint") ?? new LingoList([0, 0]);
       }
       return this.memberRuntimeProps.get(`dynamic:${dyn.id}`)?.get(lower);
     }
@@ -1472,6 +1541,9 @@ export class LingoRuntimeHost implements LingoHost {
     }
     if (lower === "width" || lower === "height") {
       return resolved ? (lower === "width" ? resolved.bakedWidth : resolved.bakedHeight) : 0;
+    }
+    if (lower === "regpoint") {
+      return new LingoList([resolved?.regX ?? 0, resolved?.regY ?? 0]);
     }
     if (lower === "image") {
       const key = this.memberCacheKey(resolved, member as MemberToken);
@@ -1591,6 +1663,15 @@ export class LingoRuntimeHost implements LingoHost {
       if (lower === "text" || lower === "htmltext") {
         const text = normalizeLineEndings(String(value));
         dyn.text = text;
+        const props = this.memberRuntimeProps.get(`dynamic:${dyn.id}`);
+        const memberRect = props?.get("rect");
+        if (props?.get("__autoheight") === true && memberRect instanceof LingoList) {
+          const left = Number(memberRect.getAt(1));
+          const top = Number(memberRect.getAt(2));
+          const right = Number(memberRect.getAt(3));
+          const rendered = this.renderTextMemberImage(dyn, right - left, 0);
+          props.set("rect", rect(left, top, right, top + rendered.height));
+        }
       }
       if (lower === "name") {
         const newName = String(value);
@@ -1618,6 +1699,9 @@ export class LingoRuntimeHost implements LingoHost {
           this.memberRuntimeProps.set(`dynamic:${dyn.id}`, props);
         }
         props.set(lower, value);
+        if (lower === "rect" && value instanceof LingoList) {
+          props.set("__autoheight", Number(value.getAt(4)) - Number(value.getAt(2)) <= 0);
+        }
         this.aliasMemberProp(props, lower);
       }
       return;
@@ -1700,10 +1784,10 @@ export class LingoRuntimeHost implements LingoHost {
     const fontSize = Math.max(1, Number(props?.get("fontsize") ?? props?.get("fontSize") ?? 12));
     const rawFont = props?.get("font");
     const fontMap: Record<string, string> = {
-      v: "Verdana, sans-serif",
-      V: "Verdana, sans-serif",
-      vb: "Verdana, sans-serif",
-      VB: "Verdana, sans-serif",
+      v: "\"LS Volter\"",
+      V: "\"LS Volter\"",
+      vb: "\"LS Volter\"",
+      VB: "\"LS Volter\"",
     };
     const fontFamily = typeof rawFont === "string" && rawFont.length > 0
       ? (fontMap[rawFont] ?? rawFont)
@@ -1724,6 +1808,9 @@ export class LingoRuntimeHost implements LingoHost {
         styles.add(name);
       }
     }
+    if (rawFont === "vb" || rawFont === "VB") {
+      styles.add("bold");
+    }
     const fontStyle = styles.size > 0 ? Array.from(styles).join(" ") : "normal";
 
     const color = parseColor(props?.get("color") ?? props?.get("txtcolor"));
@@ -1740,7 +1827,13 @@ export class LingoRuntimeHost implements LingoHost {
     }
 
     const wordWrap = lingoTruthy(props?.get("wordwrap") ?? props?.get("wordWrap") ?? false);
-    const lineHeight = Math.max(1, Number(props?.get("fixedlinespace") ?? props?.get("fixedLineSpace") ?? fontSize + 2));
+    // Director stores writer leading as `topSpacing` in addition to the
+    // member's fixed line space. Habbo's Writer Class deliberately keeps
+    // fixedLineSpace equal to fontSize and sets topSpacing to the remaining
+    // requested line height (for example 9 + 9 = 18 for navigator rows).
+    const fixedLineSpace = Number(props?.get("fixedlinespace") ?? props?.get("fixedLineSpace") ?? fontSize + 2);
+    const topSpacing = Number(props?.get("topspacing") ?? props?.get("topSpacing") ?? 0);
+    const lineHeight = Math.max(1, fixedLineSpace + topSpacing);
 
     // Measure text using a 1px-high canvas; resizing the canvas resets the context, so the
     // real font/state will be set again below once the final height is known.
@@ -1783,7 +1876,10 @@ export class LingoRuntimeHost implements LingoHost {
     ctx.textBaseline = "top";
     ctx.textAlign = textAlign;
 
-    let y = 0;
+    // Director applies topSpacing before the first baseline as well as between
+    // subsequent lines. Writer call sites intentionally offset the returned
+    // image by this authored leading.
+    let y = topSpacing;
     for (const line of lines) {
       let x = 0;
       if (textAlign === "center") x = canvas.width / 2;
@@ -1812,19 +1908,8 @@ export class LingoRuntimeHost implements LingoHost {
     // still report that rect height. Director's text image should only be as tall as
     // the rendered glyphs, otherwise Habbo's unique/image-wrapper elements scale or
     // crop a 480px blank area and the text disappears.
-    let firstRow = 0;
+    const firstRow = 0;
     let lastRow = canvasHeight - 1;
-    while (firstRow < canvasHeight) {
-      let rowHasAlpha = false;
-      for (let x = 0; x < canvas.width; ++x) {
-        if ((pixels[firstRow * canvas.width + x] >>> 24) !== 0) {
-          rowHasAlpha = true;
-          break;
-        }
-      }
-      if (rowHasAlpha) break;
-      firstRow += 1;
-    }
     while (lastRow > firstRow) {
       let rowHasAlpha = false;
       for (let x = 0; x < canvas.width; ++x) {
@@ -2286,21 +2371,36 @@ export class LingoRuntimeHost implements LingoHost {
         // Director `new script(member(...))` is emitted as `newObj("script", [member])`.
         // Resolve the member to its script name and create the instance via the script creator.
         if (lowerType === "script") {
-          let scriptName: string | undefined;
+          let scriptToken: string | undefined;
           const firstArg = ctorArgs[0];
           if (firstArg instanceof LingoMemberProxy) {
-            scriptName = firstArg.name;
+            const info = this.getScriptMemberInfo(firstArg.token);
+            if (info) {
+              scriptToken = `script("${info.name}"),${info.castLib},${info.memberId}`;
+            }
           } else if (firstArg instanceof LingoList && firstArg.count > 0) {
             const item = firstArg.get(1);
             if (item instanceof LingoMemberProxy) {
-              scriptName = item.name;
+              const info = this.getScriptMemberInfo(item.token);
+              if (info) {
+                scriptToken = `script("${info.name}"),${info.castLib},${info.memberId}`;
+              }
             } else if (typeof item === "string") {
-              scriptName = this.scriptTokenName(item) ?? item;
+              scriptToken = item.startsWith('script("')
+                ? item
+                : `script("${this.scriptTokenName(item) ?? item}")`;
             }
+          } else if (typeof firstArg === "string") {
+            scriptToken = firstArg.startsWith('script("')
+              ? firstArg
+              : `script("${this.scriptTokenName(firstArg) ?? firstArg}")`;
           }
-          if (scriptName) {
+          if (scriptToken) {
             if (this.scriptInstanceCreator) {
-              return this.scriptInstanceCreator(`script("${scriptName}")`, []);
+              return this.scriptInstanceCreator(
+                scriptToken,
+                typeof firstArg === "string" ? ctorArgs.slice(1) : [],
+              );
             }
             return undefined;
           }

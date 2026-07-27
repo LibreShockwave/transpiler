@@ -21,9 +21,71 @@ import {
   lingoTruthy,
   LINGO_VOID,
   SUPPORTED_LINGO_BUILTINS,
+  LingoImage,
+  getAt,
+  setAt,
+  rect,
+  ilk,
+  rgb,
   type LingoHost,
   type LingoValue,
 } from "../src/lingo-runtime.js";
+
+describe("LingoImage trimWhiteSpace", () => {
+  it("returns a new tightly cropped image like LibreShockwave", () => {
+    const image = new LingoImage(4, 4, 32);
+    image.bitmap.fill(0xffffffff);
+    image.bitmap.pixels()[2 * 4 + 1] = 0xff123456;
+
+    const trimmed = image.trimWhiteSpace();
+
+    expect(trimmed).not.toBe(image);
+    expect([trimmed.width, trimmed.height]).toEqual([1, 1]);
+    expect(trimmed.bitmap.pixels()[0]).toBe(0xff123456);
+  });
+
+  it("returns a 1x1 white image when no non-white content remains", () => {
+    const image = new LingoImage(3, 2, 32);
+    image.bitmap.fill(0xffffffff);
+
+    const trimmed = image.trimWhiteSpace();
+
+    expect([trimmed.width, trimmed.height]).toEqual([1, 1]);
+    expect(trimmed.bitmap.pixels()[0]).toBe(0xffffffff);
+  });
+});
+
+describe("LingoImage createMatte", () => {
+  it("makes edge-connected white background transparent", () => {
+    const image = new LingoImage(3, 3, 32);
+    image.bitmap.fill(0xffffffff);
+    image.bitmap.pixels()[4] = 0xff112233;
+
+    const matte = image.createMatte();
+
+    expect(matte.bitmap.pixels()[0] >>> 24).toBe(0);
+    expect(matte.bitmap.pixels()[4] >>> 24).toBe(255);
+    expect(matte.bitmap.hasNativeMatteAlpha()).toBe(true);
+  });
+});
+
+describe("getAt/setAt bytecode semantics", () => {
+  it("keeps positional propList access distinct from digit-string keys", () => {
+    const list = new LingoPropList(["5", "key five", "other", "second"]);
+    expect(getAt(list, 1)).toBe("key five");
+    expect(getAt(list, "5")).toBe("key five");
+    expect(getAt(list, 2)).toBe("second");
+    setAt(list, 2, "changed");
+    expect(getAt(list, 2)).toBe("changed");
+  });
+
+  it("supports generic object operands accepted by Director bracket bytecode", () => {
+    const object = { status: 1 } as unknown as LingoValue;
+    expect(getAt(object, "status")).toBe(1);
+    setAt(object, "status", 2);
+    expect(getAt(object, symbol("status"))).toBe(2);
+  });
+});
 
 describe("line chunks", () => {
   it("recognizes Director RETURN, Unix LF, and Windows CRLF separators", () => {
@@ -41,6 +103,28 @@ describe("point and rect list properties", () => {
     };
     expect([r.left, r.top, r.right, r.bottom]).toEqual([10, 20, 42, 65]);
     expect([r.width, r.height]).toEqual([32, 45]);
+  });
+
+  it("preserves Director rect type identity", () => {
+    const r = rect(10, 20, 42, 65);
+    expect(String(ilk(r))).toBe("#rect");
+    expect(ilk(r, symbol("rect"))).toBe(true);
+    expect(String(ilk(new LingoList([10, 20, 42, 65])))).toBe("#list");
+  });
+});
+
+describe("Director color identity", () => {
+  it("reports ColorRef values as #color through property and ilk()", () => {
+    const color = rgb(12, 34, 56) as { ilk: unknown };
+    expect(String(color.ilk)).toBe("#color");
+    expect(ilk(color as LingoValue, symbol("color"))).toBe(true);
+  });
+});
+
+describe("value geometry literals", () => {
+  it("parses point() and rect() expressions used by external variables", () => {
+    expect((value("point(5, 7)") as LingoList).toArray()).toEqual([5, 7]);
+    expect(ilk(value("rect(1, 2, 11, 22)"), symbol("rect"))).toBe(true);
   });
 });
 

@@ -28,7 +28,7 @@ interface Manifest {
   runtimeVersion: string;
   stage: { width: number; height: number; backgroundColor: number };
   scripts?: Array<{ file: string }>;
-  castlibs?: Array<{ number: number; name: string; fileName: string; file: string }>;
+  castlibs?: Array<{ number: number; name: string; fileName: string; file: string; templateOnly?: boolean }>;
 }
 
 interface ScriptModule {
@@ -52,6 +52,7 @@ interface CastlibModule {
     bakedBitmapAsset?: string;
     bakedWidth?: number;
     bakedHeight?: number;
+    paletteColors?: number[];
   }>;
   lsScripts: Array<{ name: string; castMember: number; file: string }>;
 }
@@ -77,6 +78,15 @@ const loadModule = async (file: string): Promise<Record<string, unknown>> => {
 };
 
 void (async () => {
+  // Dynamic text members can be rendered during the first movie handlers.
+  // Ensure the bundled Director pixel faces are ready before any canvas text
+  // is measured or rasterized, avoiding a permanent fallback-font image.
+  if (typeof document !== "undefined" && "fonts" in document) {
+    await Promise.all([
+      document.fonts.load('9px "LS Volter"'),
+      document.fonts.load('bold 9px "LS Volter"'),
+    ]);
+  }
   const manifest = await fetchJson<Manifest>("/manifest.json");
   const score = await fetchJson<ScoreJson>("/score.json");
   const cast = await fetchJson<CastJson>("/cast.json");
@@ -143,7 +153,15 @@ void (async () => {
   const params = new URLSearchParams(window.location.search);
   const baseUrl = params.get("__lsBaseUrl") ?? `${window.location.origin}/`;
   setNetworkBaseUrl(baseUrl);
-  host.setThe("moviePath", baseUrl);
+  // Director's moviePath describes the directory containing the embedded
+  // movie, which is independent from the export's asset/network base URL.
+  // Shockwave supplies the movie URL through the conventional `src` embed
+  // parameter; retain the base URL fallback for standalone exports.
+  const movieSrc = params.get("src");
+  const moviePath = movieSrc
+    ? new URL(".", new URL(movieSrc, window.location.href)).href
+    : baseUrl;
+  host.setThe("moviePath", moviePath);
   const playerObject = host.getGlobal("_player") as unknown as {
     externalParams: { add: (key: string, value: string) => void };
   };
@@ -204,7 +222,7 @@ void (async () => {
         },
       ]),
     );
-    host.registerCastlib({
+    const record = {
       number: module.lsCastLib,
       name: module.lsCastLibName || ref.name,
       fileName: ref.fileName,
@@ -212,13 +230,31 @@ void (async () => {
       membersByName: new Map(module.lsMembers.map((member) => [member.name, member.id])),
       scriptsByName: new Map(module.lsScripts.map((script) => [script.name, script.castMember])),
       scriptsByCastMember: new Map(module.lsScripts.map((script) => [script.castMember, script.name])),
-    });
+    };
+    const declared = host.getCastlib(ref.number);
+    // A downloaded cast keeps its authored cast number in the emitted module,
+    // but Director may import it into a different live slot.  By the time the
+    // asynchronous module load completes, that authored slot can already have
+    // been reassigned to another cast.  Never register into such a reassigned
+    // slot: doing so pollutes numeric member lookup (while the slot's copied
+    // member table itself can still look correct).  Cache it as a template and
+    // let setCastlibName() copy it into the loader-selected live slot.
+    if (
+      declared
+      && !/^empty(?:\s|$)/i.test(declared.name)
+      && declared.name.toLowerCase() === record.name.toLowerCase()
+    ) {
+      host.registerCastlib(record);
+    } else {
+      host.registerCastlibTemplate(record);
+    }
   };
   const castlibRefs: CastlibModuleRef[] = (manifest.castlibs ?? []).map((castlib) => ({
     file: castlib.file,
     number: castlib.number,
     name: castlib.name,
     fileName: castlib.fileName,
+    templateOnly: castlib.templateOnly,
   }));
   setCastlibModuleMap(castlibRefs);
   setCastlibRegistrar(registerCastlibModule);
@@ -228,6 +264,7 @@ void (async () => {
   // for `preloadNetThing(castLib(n).fileName)` to drive the lazy module load. The
   // member tables stay empty until `registerCastlib` fills them on demand.
   for (const ref of castlibRefs) {
+    if (ref.templateOnly) continue;
     host.declareCastlib(ref.number, ref.name, ref.fileName);
   }
 

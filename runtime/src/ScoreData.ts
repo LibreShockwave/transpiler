@@ -40,6 +40,8 @@ export interface ScoreSpriteJson {
   backColor?: number;
   hasForeColor?: boolean;
   hasBackColor?: boolean;
+  shapeLineSize?: number | null;
+  shapePattern?: number | null;
 }
 
 export interface ScoreBehaviorJson {
@@ -91,6 +93,11 @@ export interface CastMemberJson {
   /** Authored Director registration point within the member bitmap. */
   regX?: number;
   regY?: number;
+  shapeType?: number;
+  shapeFilled?: boolean;
+  shapeLineSize?: number;
+  shapePattern?: number;
+  shapeLineDirection?: number;
   /** Static text content for text/field cast members (Lingo can mutate it at runtime). */
   text?: string;
   /** Film-loop cast members only: one baked asset per internal sub-frame. */
@@ -206,6 +213,9 @@ export function buildSprite(
     }
   }
   const ink: InkMode = inkModeFromCode(json.ink);
+  const member = json.castMemberName
+    ? castLookup.get(`name:${json.castMemberName}`)
+    : undefined;
   return {
     channel: json.channel,
     x: json.x,
@@ -215,10 +225,10 @@ export function buildSprite(
     locZ: json.locZ,
     visible: json.visible,
     type: coerceSpriteType(json.type),
-    foreColor: 0,
-    backColor: 0,
-    hasForeColor: false,
-    hasBackColor: false,
+    foreColor: json.foreColor ?? 0,
+    backColor: json.backColor ?? 0,
+    hasForeColor: json.hasForeColor ?? false,
+    hasBackColor: json.hasBackColor ?? false,
     ink,
     blend: json.blend,
     flipH: json.flipH,
@@ -227,8 +237,11 @@ export function buildSprite(
     skew: json.skew,
     bakedBitmap,
     hasBehaviors: json.hasBehaviors ?? false,
-    shapeLineSize: null,
-    shapePattern: null,
+    shapeType: member?.shapeType ?? null,
+    shapeFilled: member?.shapeFilled ?? null,
+    shapeLineSize: json.shapeLineSize ?? member?.shapeLineSize ?? null,
+    shapePattern: json.shapePattern ?? member?.shapePattern ?? null,
+    shapeLineDirection: member?.shapeLineDirection ?? null,
     castMemberId: json.castMemberId ?? -1,
     castMemberName: json.castMemberName ?? null,
   };

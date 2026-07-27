@@ -45,6 +45,7 @@
 #include "libreshockwave/chunks/ScriptNamesChunk.hpp"
 #include "libreshockwave/chunks/SoundChunk.hpp"
 #include "libreshockwave/chunks/TextChunk.hpp"
+#include "libreshockwave/cast/CastMember.hpp"
 #include "libreshockwave/lingo/decompiler/LingoDecompiler.hpp"
 #include "libreshockwave/player/audio/SoundManager.hpp"
 #include "libreshockwave/player/cast/CastLib.hpp"
@@ -205,14 +206,28 @@ void copyProjectSkeleton(const fs::path& outDir) {
 #ifndef LIBRESHOCKWAVE_TS_RUNTIME_DIR
 #define LIBRESHOCKWAVE_TS_RUNTIME_DIR ""
 #endif
+#ifndef LIBRESHOCKWAVE_FONT_RESOURCE_DIR
+#define LIBRESHOCKWAVE_FONT_RESOURCE_DIR ""
+#endif
     const fs::path runtimeRoot = LIBRESHOCKWAVE_TS_RUNTIME_DIR;
+    const fs::path fontRoot = LIBRESHOCKWAVE_FONT_RESOURCE_DIR;
 #undef LIBRESHOCKWAVE_TS_RUNTIME_DIR
+#undef LIBRESHOCKWAVE_FONT_RESOURCE_DIR
     if (runtimeRoot.empty() || !fs::exists(runtimeRoot)) {
         throw std::runtime_error("Runtime source not found: " + runtimeRoot.string());
     }
     copyTree(runtimeRoot / "project", outDir);
     fs::create_directories(outDir / "src" / "runtime");
     copyTree(runtimeRoot / "src", outDir / "src" / "runtime");
+    if (!fontRoot.empty()) {
+        const fs::path volterRoot = fontRoot / "volter";
+        const fs::path fontOut = outDir / "public" / "fonts";
+        fs::create_directories(fontOut);
+        fs::copy_file(volterRoot / "volter.ttf", fontOut / "volter.ttf",
+                      fs::copy_options::overwrite_existing);
+        fs::copy_file(volterRoot / "volter_bold.ttf", fontOut / "volter_bold.ttf",
+                      fs::copy_options::overwrite_existing);
+    }
 }
 
 // --- pre-bake cast member assets ---------------------------------------------
@@ -644,6 +659,7 @@ struct CastMemberRecord {
     int regY = 0;
     std::string text; // static text content for text/field cast members
     std::vector<std::string> filmLoopFrames; // one asset per internal sub-frame
+    std::vector<std::uint32_t> paletteColors; // palette members only
 };
 
 namespace {
@@ -728,6 +744,11 @@ void preBakeCastMemberAssets(
             cm.type = std::string(::libreshockwave::cast::name(memberType));
             cm.regX = memberChunk->regPointX();
             cm.regY = memberChunk->regPointY();
+            if (auto member = castLib->getMember(memberNumber)) {
+                if (auto palette = member->paletteData()) {
+                    cm.paletteColors = palette->colors();
+                }
+            }
 
             // Text / Button / Shape members are not pre-baked. Their intrinsic
             // dimensions can be enormous (text members used as data buffers with
@@ -1004,6 +1025,16 @@ ScriptRecord emitScriptModule(
         if (handlerName.empty()) {
             continue;
         }
+        if (const char* dumpHandler = std::getenv("LS_DUMP_HANDLER");
+            dumpHandler != nullptr && handlerName == dumpHandler) {
+            const char* dumpScript = std::getenv("LS_DUMP_SCRIPT");
+            if (dumpScript == nullptr || rawName == dumpScript) {
+                ls::lingo::decompiler::LingoDecompiler diagnosticDecompiler;
+                std::cerr << "export_ts: bytecode script=\"" << rawName
+                          << "\" handler=\"" << handlerName << "\"\n"
+                          << diagnosticDecompiler.formatHandlerBytecodeOnly(handler, namesPtr);
+            }
+        }
         try {
             ls::lingo::decompiler::LingoDecompiler tsDecompiler;
             ts << tsDecompiler.emitTypeScriptHandler(handler, *script, namesPtr) << "\n";
@@ -1036,8 +1067,9 @@ ScriptRecord emitScriptModule(
         ts << ");\n";
         ts << "    } catch (e) {\n";
         ts << "      if (e instanceof LingoNotImplemented) throw e;\n";
+        ts << "      const detail = e instanceof Error && e.stack ? e.stack : String(e);\n";
         ts << "      throw new LingoNotImplemented(\"Lingo handler '" << jsonEscape(hr.name)
-           << "' threw during TS execution: \" + String(e));\n";
+           << "' threw during TS execution: \" + detail);\n";
         ts << "    }\n";
         ts << "  },\n";
     }
@@ -1070,6 +1102,7 @@ struct CastlibRecord {
     std::string fileName;       // original .cct filename (e.g. "fuse_client.cct")
     std::string file;           // emitted TS file path ("src/castlibs/castlib_<n>_<safeName>.ts")
     bool isExternal = true;     // true for .cct casts; false for the main movie's internal cast
+    bool templateOnly = false;  // emitted for lazy name/file lookup, not a declared movie slot
     int memberCount = 0;        // total members registered
     int scriptCount = 0;        // number of script members referenced from this castlib
 };
@@ -1346,7 +1379,6 @@ int main(int argc, char** argv) {
             }
             return set;
         }();
-
         // Snapshot the loaded external cast libraries (num -> castLib) before
         // player.play() runs, since play() can drop members from casts that are
         // not part of the score. The castlib emission loop uses this snapshot so
@@ -1514,7 +1546,32 @@ int main(int argc, char** argv) {
                       [](const LabelRecord& a, const LabelRecord& b) { return a.frame < b.frame; });
         }
 
-        const auto& navigator = player.navigator();
+        // Build navigation from the fully loaded DirectorFile. Player constructs its
+        // navigator before the movie's score chunks are loaded, so that cached navigator
+        // can contain no spans even though the parsed score now has frame intervals.
+        // Exporting from a fresh navigator preserves frame scripts and sprite behaviors.
+        const ls::player::score::ScoreNavigator navigator(directorFile.get());
+        if (std::getenv("LS_DUMP_SCORE") != nullptr) {
+            if (const auto scoreChunk = directorFile->scoreChunk()) {
+                const auto& fd = scoreChunk->frameData();
+                std::cerr << "export_ts: score frameCount=" << fd.header.frameCount
+                          << " framesVersion=" << fd.header.framesVersion
+                          << " spriteRecordSize=" << fd.header.spriteRecordSize
+                          << " numChannels=" << fd.header.numChannels
+                          << " channelEntries=" << fd.frameChannelData.size()
+                          << " intervals=" << scoreChunk->frameIntervals().size()
+                          << " spans=" << navigator.getAllSpans().size() << "\n";
+                for (const auto& interval : scoreChunk->frameIntervals()) {
+                    std::cerr << "export_ts: interval channel=" << interval.primary.channelIndex
+                              << " frames=" << interval.primary.startFrame << "-" << interval.primary.endFrame;
+                    if (interval.secondary) {
+                        std::cerr << " behavior=" << interval.secondary->castLib
+                                  << ":" << interval.secondary->castMember;
+                    }
+                    std::cerr << "\n";
+                }
+            }
+        }
         for (int frame = 1; frame <= framesToExport; ++frame) {
             const auto snapshot = player.frameRenderPipeline().renderFrame(frame);
             stageWidth = snapshot.stageWidth;
@@ -1873,6 +1930,27 @@ int main(int argc, char** argv) {
                 }
                 allScripts.push_back(script);
             }
+            // scriptOwnership is an unordered map, so iteration order is not stable
+            // across processes. Manifest order controls module registration order in
+            // the browser and must therefore be reproducible. Director's physical
+            // cast/member order is the natural total ordering for script members.
+            std::sort(allScripts.begin(), allScripts.end(),
+                      [&](const auto& a, const auto& b) {
+                          const auto key = [&](const auto& script) {
+                              int castLib = 0;
+                              int castMember = 0;
+                              std::string name;
+                              if (const auto it = scriptOwnership.find(script);
+                                  it != scriptOwnership.end()) {
+                                  castLib = std::get<0>(it->second);
+                                  castMember = std::get<1>(it->second);
+                                  name = std::get<2>(it->second);
+                              }
+                              if (name.empty()) name = script->scriptName();
+                              return std::tuple{castLib, castMember, name};
+                          };
+                          return key(a) < key(b);
+                      });
 
             for (std::size_t si = 0; si < allScripts.size(); ++si) {
                 const auto& script = allScripts[si];
@@ -2126,6 +2204,12 @@ int main(int argc, char** argv) {
                 ts << "  bakedHeight?: number;\n";
                 ts << "  regX?: number;\n";
                 ts << "  regY?: number;\n";
+                ts << "  shapeType?: number;\n";
+                ts << "  shapeFilled?: boolean;\n";
+                ts << "  shapeLineSize?: number;\n";
+                ts << "  shapePattern?: number;\n";
+                ts << "  shapeLineDirection?: number;\n";
+                ts << "  paletteColors?: number[];\n";
                 ts << "}\n\n";
                 ts << "export const lsMembers: LsCastlibMember[] = [\n";
 
@@ -2191,6 +2275,17 @@ int main(int argc, char** argv) {
                        << ", type: \"" << jsonEscape(typeName) << "\""
                        << ", regX: " << memberChunk->regPointX()
                        << ", regY: " << memberChunk->regPointY();
+                    if (memberChunk->memberType() == ::libreshockwave::cast::MemberType::Shape) {
+                        const auto shapeMember = ::libreshockwave::cast::CastMember(
+                            memberChunk->id().value(), num, memberNumber, memberChunk);
+                        ts << ", shapeType: " << static_cast<int>(shapeMember.shapeType())
+                           << ", shapeFilled: " << (shapeMember.shapeFilled() ? "true" : "false")
+                           << ", shapeLineSize: " << shapeMember.shapeLineSize()
+                           << ", shapePattern: " << shapeMember.shapePattern();
+                        if (const auto& shapeInfo = shapeMember.shapeInfo()) {
+                            ts << ", shapeLineDirection: " << shapeInfo->lineDirection;
+                        }
+                    }
                     if (!memberText.empty()) {
                         ts << ", text: \"" << jsonEscape(memberText) << "\"";
                     }
@@ -2198,6 +2293,24 @@ int main(int argc, char** argv) {
                         ts << ", bakedBitmapAsset: \"" << jsonEscape(bakedAsset) << "\""
                            << ", bakedWidth: " << bakedW
                            << ", bakedHeight: " << bakedH;
+                    }
+                    auto palette = player.castLibManager().resolvePaletteByMember(num, memberNumber);
+                    if (!palette && castlibDirectorFile) {
+                        palette = castlibDirectorFile->resolvePaletteByMemberNumber(memberNumber);
+                    }
+                    if (!palette) {
+                        if (auto member = castLib->getMember(memberNumber)) {
+                            palette = member->paletteData();
+                        }
+                    }
+                    if (palette) {
+                        ts << ", paletteColors: [";
+                        const auto& colors = palette->colors();
+                        for (std::size_t pi = 0; pi < colors.size(); ++pi) {
+                            if (pi > 0) ts << ", ";
+                            ts << colors[pi];
+                        }
+                        ts << "]";
                     }
                     ts << " }";
                     if (++memberIdx < castLib->memberChunks().size()) ts << ",";
@@ -2370,6 +2483,7 @@ int main(int argc, char** argv) {
             rec.fileName = fileName;
             rec.file = rel;
             rec.isExternal = true;
+            rec.templateOnly = physicalSlot == namedPhysicalSlots.end();
             rec.memberCount = 0;
             rec.scriptCount = 0;
 
@@ -2396,6 +2510,12 @@ int main(int argc, char** argv) {
             ts << "  bakedHeight?: number;\n";
             ts << "  regX?: number;\n";
             ts << "  regY?: number;\n";
+            ts << "  shapeType?: number;\n";
+            ts << "  shapeFilled?: boolean;\n";
+            ts << "  shapeLineSize?: number;\n";
+            ts << "  shapePattern?: number;\n";
+            ts << "  shapeLineDirection?: number;\n";
+            ts << "  paletteColors?: number[];\n";
             ts << "}\n\n";
             ts << "export const lsMembers: LsCastlibMember[] = [\n";
 
@@ -2440,6 +2560,17 @@ int main(int argc, char** argv) {
                    << ", type: \"" << jsonEscape(typeName) << "\""
                    << ", regX: " << memberChunk->regPointX()
                    << ", regY: " << memberChunk->regPointY();
+                if (memberType == ::libreshockwave::cast::MemberType::Shape) {
+                    const auto shapeMember = ::libreshockwave::cast::CastMember(
+                        memberChunk->id().value(), slot, memberNumber, memberChunk);
+                    ts << ", shapeType: " << static_cast<int>(shapeMember.shapeType())
+                       << ", shapeFilled: " << (shapeMember.shapeFilled() ? "true" : "false")
+                       << ", shapeLineSize: " << shapeMember.shapeLineSize()
+                       << ", shapePattern: " << shapeMember.shapePattern();
+                    if (const auto& shapeInfo = shapeMember.shapeInfo()) {
+                        ts << ", shapeLineDirection: " << shapeInfo->lineDirection;
+                    }
+                }
                 if (!memberText.empty()) {
                     ts << ", text: \"" << jsonEscape(memberText) << "\"";
                 }
@@ -2447,6 +2578,18 @@ int main(int argc, char** argv) {
                     ts << ", bakedBitmapAsset: \"" << jsonEscape(bakedAsset) << "\""
                        << ", bakedWidth: " << bakedW
                        << ", bakedHeight: " << bakedH;
+                }
+                if (memberType == ::libreshockwave::cast::MemberType::Palette) {
+                    auto palette = cctDirectorFile->resolvePaletteByMemberNumber(memberNumber);
+                    if (palette) {
+                    ts << ", paletteColors: [";
+                    const auto& colors = palette->colors();
+                    for (std::size_t pi = 0; pi < colors.size(); ++pi) {
+                        if (pi > 0) ts << ", ";
+                        ts << colors[pi];
+                    }
+                    ts << "]";
+                    }
                 }
                 ts << " }";
                 if (i + 1 < members.size()) ts << ",";
@@ -2593,6 +2736,7 @@ int main(int argc, char** argv) {
                       << ", \"fileName\": \"" << jsonEscape(cl.fileName) << "\""
                       << ", \"file\": \"" << jsonEscape(cl.file) << "\""
                       << ", \"isExternal\": " << (cl.isExternal ? "true" : "false")
+                      << ", \"templateOnly\": " << (cl.templateOnly ? "true" : "false")
                       << ", \"memberCount\": " << cl.memberCount
                       << ", \"scriptCount\": " << cl.scriptCount
                       << " }";
@@ -2747,6 +2891,12 @@ int main(int argc, char** argv) {
                     if (f + 1 < cm.filmLoopFrames.size()) {
                         cf << ", ";
                     }
+                }
+                cf << "]";
+                cf << ", \"paletteColors\": [";
+                for (std::size_t p = 0; p < cm.paletteColors.size(); ++p) {
+                    if (p > 0) cf << ", ";
+                    cf << cm.paletteColors[p];
                 }
                 cf << "]";
                 cf << " }";

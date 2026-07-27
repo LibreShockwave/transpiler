@@ -182,7 +182,7 @@ export class LingoList {
           // emits `someValue.ilk` as a property access, so the LingoList/LingoPropList proxies
           // must expose `.ilk` as a property that returns the type symbol (e.g. `#list`).
           if (prop === "ilk") {
-            return symbol("list");
+            return symbol(target instanceof LingoRect ? "rect" : "list");
           }
           const member = (target as unknown as Record<string, unknown>)[prop];
           if (typeof member === "function") {
@@ -367,6 +367,19 @@ export class LingoList {
   }
 }
 
+/** Director rectangle datum. Rects retain list-like 1-based access while
+ * reporting `#rect` from `ilk`, unlike an ordinary four-item list. */
+export class LingoRect extends LingoList {
+  override duplicate(): LingoRect {
+    const values = this.toArray();
+    return new LingoRect(values[0], values[1], values[2], values[3]);
+  }
+
+  constructor(left: LingoValue, top: LingoValue, right: LingoValue, bottom: LingoValue) {
+    super([left, top, right, bottom]);
+  }
+}
+
 // A propList is an ordered list of [:symbol: value] pairs (Director's [:a:1, :b:2]). Duplicate
 // keys update in place; missing keys read as VOID. Insertion order is preserved for `count` and
 // iteration, matching Director's propList semantics.
@@ -430,6 +443,14 @@ export class LingoPropList {
         // key "7" (7), not vals[6] (6, the value for key "6"). Resolve by key first;
         // only fall back to 1-based positional indexing when the digit is NOT a key.
         if (typeof prop === "string" && /^\d+$/.test(prop)) {
+          const keyedIndex = target.findKeyIndex(prop);
+          // JS coerces both `pList[i]` and `pList["7"]` to a string property.
+          // Preserve Lingo's distinction using the key's original datum type:
+          // a stored string digit is a key lookup, while a stored numeric key
+          // does not turn integer bracket access into getaProp.
+          if (keyedIndex >= 0 && typeof target.origKeys[keyedIndex] === "string") {
+            return target.get(prop);
+          }
           const idx = Number(prop);
           if (idx >= 1 && idx <= target.keys.length) {
             return target.vals[idx - 1];
@@ -458,6 +479,11 @@ export class LingoPropList {
       },
       set(target, prop, value) {
         if (typeof prop === "string" && /^\d+$/.test(prop)) {
+          const keyedIndex = target.findKeyIndex(prop);
+          if (keyedIndex >= 0 && typeof target.origKeys[keyedIndex] === "string") {
+            target.set(prop, value as LingoValue);
+            return true;
+          }
           const idx = Number(prop);
           if (idx >= 1 && idx <= target.keys.length) {
             target.vals[idx - 1] = value as LingoValue;
@@ -738,10 +764,12 @@ export function bitXor(a: LingoValue, b: LingoValue): number {
   return (ai ^ bi) | 0;
 }
 
-// String(x) in Lingo: VOID -> "VOID", TRUE/FALSE capitalized, lists bracketed.
+// Runtime string coercion follows Director's builtin conversion semantics:
+// VOID/NULL become EMPTY. Diagnostic formatting may spell the value "VOID",
+// but expressions such as `string(VOID)` and `command & VOID` append no bytes.
 export function lingoString(value: LingoValue): string {
   if (value === LINGO_VOID || value === undefined) {
-    return "VOID";
+    return "";
   }
   if (typeof value === "boolean") {
     return value ? "TRUE" : "FALSE";
@@ -882,6 +910,11 @@ export class LingoSpriteProxy {
   get height(): number { return this.getNum("height"); }
   set height(v: LingoValue) { this.setNum("height", v); }
 
+  get left(): number { return this.getNum("left"); }
+  get top(): number { return this.getNum("top"); }
+  get right(): number { return this.getNum("right"); }
+  get bottom(): number { return this.getNum("bottom"); }
+
   get visible(): boolean { return !!this.host.getSpriteProp(this.num, "visible"); }
   set visible(v: LingoValue) { this.host.setSpriteProp(this.num, "visible", v); }
 
@@ -906,6 +939,16 @@ export class LingoSpriteProxy {
   get member(): LingoValue { return this.host.getSpriteProp(this.num, "member"); }
   set member(v: LingoValue) { this.host.setSpriteProp(this.num, "member", v); }
 
+  /** Director's numeric aliases for assigning a sprite's cast member. */
+  get memberNum(): number {
+    const member = this.host.getSpriteProp(this.num, "member");
+    if (member instanceof LingoMemberProxy) return member.number;
+    return float(member);
+  }
+  set memberNum(v: LingoValue) { this.host.setSpriteProp(this.num, "memberNum", v); }
+  get castNum(): number { return this.memberNum; }
+  set castNum(v: LingoValue) { this.host.setSpriteProp(this.num, "castNum", v); }
+
   get palette(): LingoValue { return this.host.getSpriteProp(this.num, "palette"); }
   set palette(v: LingoValue) { this.host.setSpriteProp(this.num, "palette", v); }
 
@@ -913,13 +956,10 @@ export class LingoSpriteProxy {
   set cursor(v: LingoValue) { this.host.setSpriteProp(this.num, "cursor", v); }
 
   /** `the loc of sprite n` / `set the loc of sprite n to point(x,y)` */
-  get loc(): LingoPointProxy {
-    return new LingoPointProxy(
-      () => this.locH,
-      () => this.locV,
-      (v) => { this.locH = v; },
-      (v) => { this.locV = v; },
-    );
+  get loc(): LingoList {
+    // Director returns a point value snapshot. Mutating that point does not
+    // move the sprite until the script assigns it back to sprite.loc.
+    return new LingoList([this.locH, this.locV]);
   }
   set loc(v: LingoValue) {
     const p = lingoPointToXY(v);
@@ -1983,6 +2023,15 @@ export function getAt(value: LingoValue, index: LingoValue): LingoValue {
   if (Array.isArray(value)) {
     return value[i - 1];
   }
+  if (value instanceof LingoImage) {
+    if (i === 1) return value.width;
+    if (i === 2) return value.height;
+    return undefined;
+  }
+  if (value !== null && value !== undefined && value !== LINGO_VOID && typeof value === "object") {
+    const key = isSymbol(index) ? index.name : String(index);
+    return (value as unknown as Record<string, LingoValue>)[key];
+  }
   return undefined;
 }
 
@@ -1994,6 +2043,9 @@ export function setAt(value: LingoValue, index: LingoValue, item: LingoValue): v
     value.setAt(index, item);
   } else if (Array.isArray(value)) {
     (value as LingoValue[])[i - 1] = item;
+  } else if (value !== null && value !== undefined && value !== LINGO_VOID && typeof value === "object") {
+    const key = isSymbol(index) ? index.name : String(index);
+    (value as unknown as Record<string, LingoValue>)[key] = item;
   }
 }
 
@@ -2201,8 +2253,8 @@ export function rect(
   top: LingoValue,
   right: LingoValue,
   bottom: LingoValue,
-): LingoList {
-  return new LingoList([float(left), float(top), float(right), float(bottom)]);
+): LingoRect {
+  return new LingoRect(float(left), float(top), float(right), float(bottom));
 }
 
 /** Minimal mutable Director image value used by dynamically-built UI buffers. */
@@ -2316,17 +2368,25 @@ export class LingoImage {
       }
     }
     const bgColorRaw = optionsMap ? optionsMap.getProp(symbol("bgColor")) : undefined;
-    let bgColorRgb: number | undefined;
+    const colorRaw = optionsMap ? optionsMap.getProp(symbol("color")) : undefined;
+    const colorRgb = colorRaw !== undefined && colorRaw !== LINGO_VOID
+      ? parseColor(colorRaw, source.bitmap.imagePalette()) & 0x00ffffff
+      : undefined;
+    let bgColorRgb: number | undefined = bgColorRaw !== undefined && bgColorRaw !== LINGO_VOID
+      ? parseColor(bgColorRaw, source.bitmap.imagePalette()) & 0x00ffffff
+      : undefined;
     if (ink === InkMode.BACKGROUND_TRANSPARENT) {
-      if (bgColorRaw !== undefined && bgColorRaw !== LINGO_VOID) {
-        bgColorRgb = parseColor(bgColorRaw) & 0x00ffffff;
-      } else {
+      if (bgColorRgb === undefined) {
         // Director's `#backgroundTransparent` ink keys out the sprite's background
         // color. When no explicit `#bgColor` is supplied and the source is an
         // opaque 32-bit bitmap, the C++ runtime defaults to white (0xFFFFFF).
         bgColorRgb = 0xffffff;
       }
     }
+    const blendRaw = optionsMap ? optionsMap.getProp(symbol("blend")) : undefined;
+    const blend = blendRaw === undefined || blendRaw === LINGO_VOID
+      ? 255
+      : Math.max(0, Math.min(255, Math.trunc(integer(blendRaw) * 255 / 100)));
     const from = source.bitmap.pixels();
     const to = this.bitmap.pixels();
     const maskPixels = mask ? mask.bitmap.pixels() : null;
@@ -2334,6 +2394,27 @@ export class LingoImage {
     const maskH = mask ? mask.height : 0;
     const srcPalette = source.bitmap.imagePalette();
     const srcIndices = source.depth <= 8 ? source.bitmap.paletteIndices() : null;
+    const paletteName = srcPalette?.name().toLowerCase() ?? "";
+    const indexedShade = srcIndices !== null &&
+      (paletteName === "grayscale" || paletteName === "system - mac" || paletteName === "system mac");
+    let mostlyGrayscale = true;
+    const sampleStep = Math.max(1, Math.trunc(srcWidth * srcHeight / 64));
+    for (let index = 0; index < srcWidth * srcHeight; index += sampleStep) {
+      const sampleX = integer(src[0]) + index % srcWidth;
+      const sampleY = integer(src[1]) + Math.trunc(index / srcWidth);
+      if (sampleX < 0 || sampleX >= source.width || sampleY < 0 || sampleY >= source.height) continue;
+      const pixel = from[sampleY * source.width + sampleX];
+      if (((pixel >>> 24) & 0xff) === 0) continue;
+      const r = (pixel >>> 16) & 0xff;
+      const g = (pixel >>> 8) & 0xff;
+      const b = pixel & 0xff;
+      if (Math.abs(r - g) > 2 || Math.abs(g - b) > 2) {
+        mostlyGrayscale = false;
+        break;
+      }
+    }
+    const remapGrayscale = (colorRgb !== undefined || bgColorRgb !== undefined) &&
+      !source.bitmap.hasNativeMatteAlpha() && mostlyGrayscale;
     const dstNeedsIndex = this.depth <= 8;
     for (let dy = 0; dy < dstHeight; dy += 1) {
       const ty = integer(dst[1]) + dy;
@@ -2351,7 +2432,49 @@ export class LingoImage {
           srcPixel = ((0xff << 24) | (srcPalette.getColor(srcIndices[srcOffset] & 0xff) & 0x00ffffff)) >>> 0;
         }
         if (bgColorRgb !== undefined && (srcPixel & 0x00ffffff) === bgColorRgb) {
+          if (ink !== InkMode.DARKEN) {
+            continue;
+          }
+        }
+        const alpha = (srcPixel >>> 24) & 0xff;
+        if (alpha === 0) {
           continue;
+        }
+        if (remapGrayscale && ink === InkMode.DARKEN && bgColorRgb !== undefined && colorRgb === undefined) {
+          const tintR = (bgColorRgb >>> 16) & 0xff;
+          const tintG = (bgColorRgb >>> 8) & 0xff;
+          const tintB = bgColorRgb & 0xff;
+          const srcR = (srcPixel >>> 16) & 0xff;
+          const srcG = (srcPixel >>> 8) & 0xff;
+          const srcB = srcPixel & 0xff;
+          if (srcIndices !== null) {
+            const shade = indexedShade ? 255 - (srcIndices[srcOffset] & 0xff) : srcR;
+            const preserve = indexedShade;
+            const channel = (sourceChannel: number, tint: number) =>
+              preserve && tint === 0xff ? sourceChannel : Math.trunc(sourceChannel * tint / 256);
+            srcPixel = ((alpha << 24) | (channel(shade, tintR) << 16) |
+              (channel(shade, tintG) << 8) | channel(shade, tintB)) >>> 0;
+          } else {
+            srcPixel = ((alpha << 24) |
+              (Math.trunc(srcR * tintR / 255) << 16) |
+              (Math.trunc(srcG * tintG / 255) << 8) |
+              Math.trunc(srcB * tintB / 255)) >>> 0;
+          }
+        } else if (remapGrayscale) {
+          const gray = (srcPixel >>> 16) & 0xff;
+          const foreground = colorRgb ?? 0;
+          const background = bgColorRgb ?? 0xffffff;
+          if (colorRgb !== undefined && bgColorRgb === undefined) {
+            const remappedAlpha = Math.trunc((255 - gray) * alpha / 255);
+            srcPixel = ((remappedAlpha << 24) | foreground) >>> 0;
+          } else {
+            const mix = (fg: number, bg: number) =>
+              Math.trunc(((255 - gray) * fg + gray * bg) / 255 + 0.5);
+            srcPixel = ((alpha << 24) |
+              (mix((foreground >>> 16) & 0xff, (background >>> 16) & 0xff) << 16) |
+              (mix((foreground >>> 8) & 0xff, (background >>> 8) & 0xff) << 8) |
+              mix(foreground & 0xff, background & 0xff)) >>> 0;
+          }
         }
         let srcA = (srcPixel >>> 24) & 0xff;
         if (maskPixels && maskW > 0 && maskH > 0) {
@@ -2365,7 +2488,18 @@ export class LingoImage {
         } else if (srcA === 0) {
           continue;
         }
-        to[ty * this.width + tx] = srcPixel;
+        if (blend < 255) {
+          const destPixel = to[ty * this.width + tx];
+          const effectiveAlpha = Math.trunc(srcA * blend / 255);
+          const inv = 255 - effectiveAlpha;
+          const mix = (shift: number) =>
+            Math.trunc((((srcPixel >>> shift) & 0xff) * effectiveAlpha +
+              ((destPixel >>> shift) & 0xff) * inv) / 255);
+          to[ty * this.width + tx] =
+            (0xff000000 | (mix(16) << 16) | (mix(8) << 8) | mix(0)) >>> 0;
+        } else {
+          to[ty * this.width + tx] = srcPixel;
+        }
       }
     }
     // 8-bit destinations carry parallel palette indices. Copying only the ARGB
@@ -2378,8 +2512,169 @@ export class LingoImage {
     this.bitmap.markScriptModified();
   }
   draw(..._args: LingoValue[]): void {}
-  createMatte(): LingoImage { return this.duplicate(); }
-  trimWhiteSpace(): LingoImage { return this; }
+  createMatte(alphaThreshold?: LingoValue): LingoImage {
+    const matte = createImageMatte(this.bitmap, integer(alphaThreshold));
+    return new LingoImage(matte.width(), matte.height(), matte.bitDepth(), this.paletteRef, matte);
+  }
+  trimWhiteSpace(): LingoImage {
+    const bounds = this.bitmap.trimWhiteSpace();
+    const trimmedWidth = bounds.right - bounds.left;
+    const trimmedHeight = bounds.bottom - bounds.top;
+    if (trimmedWidth <= 0 || trimmedHeight <= 0) {
+      const empty = new Bitmap(1, 1, this.depth);
+      empty.fill(0xffffffff);
+      return new LingoImage(1, 1, this.depth, this.paletteRef, empty);
+    }
+    const trimmed = this.bitmap.getRegion(bounds.left, bounds.top, trimmedWidth, trimmedHeight);
+    return new LingoImage(trimmedWidth, trimmedHeight, this.depth, this.paletteRef, trimmed);
+  }
+}
+
+function imageEdgeIndices(width: number, height: number): number[] {
+  if (width <= 0 || height <= 0) return [];
+  const result: number[] = [];
+  for (let x = 0; x < width; x += 1) {
+    result.push(x);
+    if (height > 1) result.push((height - 1) * width + x);
+  }
+  for (let y = 1; y < height - 1; y += 1) {
+    result.push(y * width);
+    if (width > 1) result.push(y * width + width - 1);
+  }
+  return result;
+}
+
+function imageCornerIndices(width: number, height: number): number[] {
+  return [0, Math.max(0, width - 1), Math.max(0, height - 1) * width,
+    Math.max(0, height - 1) * width + Math.max(0, width - 1)];
+}
+
+function createImageMatte(source: Bitmap, alphaThreshold: number): Bitmap {
+  const width = source.width();
+  const height = source.height();
+  if (width <= 0 || height <= 0) return new Bitmap(1, 1, 32);
+  const pixels = source.pixels();
+  const mattePixels = new Uint32Array(width * height);
+  mattePixels.fill(0x00ffffff);
+  if (source.hasNativeMatteAlpha()) {
+    const threshold = Math.max(0, Math.min(255, alphaThreshold));
+    for (let i = 0; i < pixels.length; i += 1) {
+      let alpha = (pixels[i] >>> 24) & 0xff;
+      if (alpha < threshold) alpha = 0;
+      mattePixels[i] = ((alpha << 24) | 0x00ffffff) >>> 0;
+    }
+    const result = new Bitmap(width, height, 32, mattePixels);
+    result.setNativeAlpha(true);
+    return result;
+  }
+
+  const indices = source.paletteIndices();
+  const edges = imageEdgeIndices(width, height);
+  const corners = imageCornerIndices(width, height);
+  let matteIndex: number | undefined;
+  let matteRgb: number | undefined;
+  if (indices && indices.length >= width * height) {
+    const rgbForIndex = (wanted: number): number => {
+      for (let i = 0; i < pixels.length; i += 1) {
+        if ((indices[i] & 0xff) === wanted) return pixels[i] & 0x00ffffff;
+      }
+      return 0xffffff;
+    };
+    const whiteCounts = new Uint16Array(256);
+    for (const i of edges) {
+      if ((pixels[i] >>> 24) !== 0 && rgbForIndex(indices[i]) === 0xffffff) whiteCounts[indices[i]] += 1;
+    }
+    let whiteIndex = -1;
+    for (let i = 0; i < 256; i += 1) if (whiteCounts[i] > (whiteIndex < 0 ? 0 : whiteCounts[whiteIndex])) whiteIndex = i;
+    const uniform = (wanted: number) => indices.every((entry) => entry === wanted);
+    if (whiteIndex >= 0 && !uniform(whiteIndex)) {
+      matteIndex = whiteIndex;
+    } else {
+      const counts = new Uint16Array(256);
+      let opaqueEdges = 0;
+      let dominant = -1;
+      for (const i of edges) {
+        if ((pixels[i] >>> 24) === 0) continue;
+        opaqueEdges += 1;
+        const idx = indices[i] & 0xff;
+        counts[idx] += 1;
+        if (dominant < 0 || counts[idx] > counts[dominant]) dominant = idx;
+      }
+      const opaqueCorners = corners.filter((i) => (pixels[i] >>> 24) !== 0);
+      if (dominant >= 0 && !uniform(dominant) && opaqueCorners.length > 0 &&
+          opaqueCorners.every((i) => indices[i] === dominant) &&
+          counts[dominant] * 4 >= opaqueEdges * 3) {
+        const rgb = rgbForIndex(dominant);
+        if (rgb === 0xffffff || (dominant === 0 && (rgb === 0 || rgb === 0xffffff))) matteIndex = dominant;
+      }
+      if (matteIndex === undefined && corners.some((i) => indices[i] === 0)) {
+        const rgb = rgbForIndex(0);
+        if (rgb === 0 || rgb === 0xffffff) matteIndex = 0;
+      }
+    }
+  } else {
+    if (edges.some((i) => (pixels[i] >>> 24) !== 0 && (pixels[i] & 0x00ffffff) === 0xffffff)) {
+      matteRgb = 0xffffff;
+    } else {
+      const counts = new Map<number, number>();
+      let opaqueEdges = 0;
+      let dominant = -1;
+      let dominantCount = 0;
+      for (const i of edges) {
+        if ((pixels[i] >>> 24) === 0) continue;
+        opaqueEdges += 1;
+        const rgb = pixels[i] & 0x00ffffff;
+        const count = (counts.get(rgb) ?? 0) + 1;
+        counts.set(rgb, count);
+        if (count > dominantCount) { dominant = rgb; dominantCount = count; }
+      }
+      const opaqueCorners = corners.filter((i) => (pixels[i] >>> 24) !== 0);
+      const uniform = pixels.every((pixel) => (pixel >>> 24) === 0 || (pixel & 0x00ffffff) === dominant);
+      if (dominant >= 0 && !uniform && opaqueCorners.length > 0 &&
+          opaqueCorners.every((i) => (pixels[i] & 0x00ffffff) === dominant) &&
+          dominantCount * 4 >= opaqueEdges * 3) {
+        const r = (dominant >>> 16) & 0xff;
+        const g = (dominant >>> 8) & 0xff;
+        const b = dominant & 0xff;
+        if (!(dominant !== 0xffffff && r >= 232 && g >= 232 && b >= 232 &&
+              Math.abs(r - g) <= 16 && Math.abs(g - b) <= 16 && Math.abs(r - b) <= 16)) {
+          matteRgb = dominant;
+        }
+      }
+    }
+  }
+
+  const connected = new Uint8Array(width * height);
+  const queue: number[] = [];
+  const isMatte = (i: number): boolean => {
+    if ((pixels[i] >>> 24) === 0) return true;
+    if (matteIndex !== undefined && indices) return indices[i] === matteIndex;
+    return matteRgb !== undefined && (pixels[i] & 0x00ffffff) === matteRgb;
+  };
+  const seed = (i: number) => {
+    if (!connected[i] && isMatte(i)) { connected[i] = 1; queue.push(i); }
+  };
+  if (matteIndex !== undefined || matteRgb !== undefined) {
+    for (const i of edges) seed(i);
+    for (let q = 0; q < queue.length; q += 1) {
+      const i = queue[q];
+      const x = i % width;
+      const y = Math.floor(i / width);
+      if (x > 0) seed(i - 1);
+      if (x + 1 < width) seed(i + 1);
+      if (y > 0) seed(i - width);
+      if (y + 1 < height) seed(i + width);
+    }
+  }
+  for (let i = 0; i < pixels.length; i += 1) {
+    if (connected[i]) continue;
+    let alpha = (pixels[i] >>> 24) & 0xff;
+    if (alpha === 0) alpha = 255;
+    mattePixels[i] = ((alpha << 24) | 0x00ffffff) >>> 0;
+  }
+  const result = new Bitmap(width, height, 32, mattePixels);
+  result.setNativeAlpha(true);
+  return result;
 }
 
 function imageRectValues(value: LingoValue): LingoValue[] | undefined {
@@ -2495,10 +2790,20 @@ export function ilk(value: LingoValue, expectedType?: LingoValue): LingoSymbol |
     typeName = Number.isInteger(value) ? "integer" : "float";
   } else if (typeof value === "boolean") {
     typeName = "integer";
+  } else if (value instanceof ColorRef ||
+      (typeof value === "object" && value !== null &&
+       "red" in value && "green" in value && "blue" in value)) {
+    typeName = "color";
+  } else if (value instanceof LingoRect) {
+    typeName = "rect";
   } else if (value instanceof LingoList || Array.isArray(value)) {
     typeName = "list";
   } else if (value instanceof LingoPropList) {
-    typeName = "propList";
+    // Structs are represented by a propList with a distinct runtime ilk.
+    // Director's `ilk(value)` must agree with `value.ilk`; connection and
+    // resource code use this distinction to accept shared pointer structs.
+    const runtimeType = value.ilk;
+    typeName = isSymbol(runtimeType) ? runtimeType.name : "propList";
   } else if (value instanceof LingoSpriteProxy) {
     typeName = "sprite";
   } else if (value instanceof LingoMemberProxy) {
@@ -2625,6 +2930,7 @@ export function rgb(r: LingoValue, g: LingoValue, b: LingoValue): LingoValue {
     red,
     green,
     blue,
+    ilk: symbol("color"),
     hexString: () => hex,
   } as unknown as LingoValue;
 }
@@ -2769,6 +3075,11 @@ export function dispatchValueBuiltin(
     case "offset": return { handled: true, value: offset(args[0], args[1]) };
     case "stringreplace":
       return { handled: true, value: stringReplace(args[0], args[1], args[2]) };
+    case "getpref":
+      return { handled: true, value: getPref(args[0], args[1]) };
+    case "setpref":
+      setPref(args[0], args[1], args[2]);
+      return { handled: true, value: undefined };
     case "put": put(...args); return { handled: true, value: undefined };
     case "alert": return { handled: true, value: undefined };
     case "count": return { handled: true, value: count(args[0]) };
@@ -3111,6 +3422,21 @@ export function value(expr: LingoValue): LingoValue {
   if (/^rgb\s*\(/i.test(s)) {
     return parseColorTriple(s);
   }
+  const pointMatch = /^point\s*\((.*)\)$/i.exec(s);
+  if (pointMatch) {
+    const parts = splitTopLevel(pointMatch[1], ",");
+    if (parts.length === 2) {
+      return new LingoList([value(parts[0].trim()), value(parts[1].trim())]);
+    }
+  }
+  const rectMatch = /^rect\s*\((.*)\)$/i.exec(s);
+  if (rectMatch) {
+    const parts = splitTopLevel(rectMatch[1], ",");
+    if (parts.length === 4) {
+      return rect(value(parts[0].trim()), value(parts[1].trim()),
+        value(parts[2].trim()), value(parts[3].trim()));
+    }
+  }
   // Director uses the same brackets for lists and property lists. A top-level
   // colon distinguishes `[#key: value]` from `[value, value]`.
   if (s.startsWith("[") && s.endsWith("]")) {
@@ -3198,7 +3524,11 @@ function findTrailingCommentIndex(s: string): number {
  */
 export function convertToPropList(text: LingoValue, delimiter: LingoValue): LingoPropList {
   const result = new LingoPropList();
-  const textStr = lingoValueToString(text);
+  // Director coerces a field/text member to its textual contents in string
+  // consumers. Emitted calls commonly pass `field("System Props")` directly,
+  // which is represented by a live member proxy in the TS runtime.
+  const source = text instanceof LingoMemberProxy ? text.text : text;
+  const textStr = lingoValueToString(source);
   const delim = (typeof delimiter === "string" && delimiter.length > 0) ? delimiter : "\r";
   for (const line of textStr.split(delim)) {
     const trimmed = line.trim();

@@ -16,6 +16,8 @@ export interface CastlibModuleRef {
   name: string;
   /** Original Director filename, e.g. `foo.cct`. */
   fileName: string;
+  /** True when this is a lazy module template rather than a slot declared by the movie. */
+  templateOnly?: boolean;
 }
 
 /** A registrar that imports an emitted castlib module and registers it on the host. */
@@ -47,9 +49,19 @@ export function setCastlibModuleMap(refs: readonly CastlibModuleRef[]): void {
   castlibModuleMap.clear();
   for (const ref of refs) {
     const byFileName = requestedFileName(ref.fileName);
-    if (byFileName) castlibModuleMap.set(byFileName, ref);
-    castlibModuleMap.set(`${ref.name.toLowerCase()}.cct`, ref);
-    castlibModuleMap.set(`${ref.name.toLowerCase()}.cst`, ref);
+    const add = (key: string): void => {
+      const existing = castlibModuleMap.get(key);
+      // A module preloaded into a physical Director slot is authoritative for
+      // that cast name. Directory-walk templates are fallbacks for casts that
+      // have no physical-slot export and must never redirect a normal download
+      // into a synthetic slot.
+      if (!existing || (existing.templateOnly && !ref.templateOnly)) {
+        castlibModuleMap.set(key, ref);
+      }
+    };
+    if (byFileName) add(byFileName);
+    add(`${ref.name.toLowerCase()}.cct`);
+    add(`${ref.name.toLowerCase()}.cst`);
   }
 }
 

@@ -89,6 +89,16 @@ export class ColorRef {
     }
   }
 
+  /** Director color datums expose `.ilk` directly. Keep this structural here
+   * to avoid coupling the bitmap value layer back to the Lingo runtime. */
+  get ilk(): { readonly __lingoSymbol: true; readonly name: "color"; readonly [Symbol.toPrimitive]: (hint: string) => string } {
+    return {
+      __lingoSymbol: true,
+      name: "color",
+      [Symbol.toPrimitive]: (hint: string) => hint === "string" ? "#color" : "color",
+    };
+  }
+
   toRgb(palette?: Palette | null): Rgb {
     if (this.value_.tag === "rgb") {
       return this.value_.value;

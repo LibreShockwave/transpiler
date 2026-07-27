@@ -45,8 +45,11 @@ export interface RenderSprite {
   /** Baked bitmap (already decoded, ink-pre-processed) or null for non-bitmap sprites. */
   bakedBitmap: Bitmap | null;
   hasBehaviors: boolean;
+  shapeType: number | null;
+  shapeFilled: boolean | null;
   shapeLineSize: number | null;
   shapePattern: number | null;
+  shapeLineDirection: number | null;
   /** Director cast member number backing this sprite, or -1 if none. */
   castMemberId: number;
   /** Name of the backing cast member, or null if unnamed. */
@@ -97,7 +100,8 @@ export function mergeScoreSnapshot(
       "x", "y", "width", "height", "locZ", "visible", "type",
       "foreColor", "backColor", "hasForeColor", "hasBackColor",
       "ink", "blend", "flipH", "flipV", "rotation", "skew",
-      "bakedBitmap", "hasBehaviors", "shapeLineSize", "shapePattern",
+      "bakedBitmap", "hasBehaviors", "shapeType", "shapeFilled",
+      "shapeLineSize", "shapePattern", "shapeLineDirection",
       "castMemberId", "castMemberName",
     ] as const) {
       if (next[key] !== previous[key]) writable[key] = next[key];

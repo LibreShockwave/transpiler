@@ -43,21 +43,225 @@ export function isSpecialCompositingInk(ink: InkMode): boolean {
   );
 }
 
-/** Render a Director #shape sprite as an opaque filled rectangle. */
+function normalizedShapePattern(sprite: RenderSprite): number {
+  const pattern = sprite.shapePattern ?? 1;
+  return pattern <= 1 ? 1 : ((pattern - 1) % 8) + 1;
+}
+
+function shapePatternOn(pattern: number, x: number, y: number): boolean {
+  switch (pattern) {
+    case 2: return ((x + y) & 1) === 0;
+    case 3: return (y & 1) === 0;
+    case 4: return (x & 1) === 0;
+    case 5: return ((x + y) & 3) === 0;
+    case 6: return ((x - y) & 3) === 0;
+    case 7: return (x & 3) === 0 || (y & 3) === 0;
+    case 8: return ((x + y) & 2) === 0;
+    default: return true;
+  }
+}
+
+/** Render a Director #shape sprite using LibreShockwave's authored ShapeInfo rules. */
 function shapeBitmap(sprite: RenderSprite): Bitmap | null {
   const w = Math.max(0, Math.floor(sprite.width));
   const h = Math.max(0, Math.floor(sprite.height));
   if (w <= 0 || h <= 0) {
     return null;
   }
-  let rgb = sprite.foreColor;
-  if (!sprite.hasForeColor && sprite.hasBackColor) {
-    rgb = sprite.backColor;
-  }
-  const color = (0xff000000 | (rgb & 0x00ffffff)) >>> 0;
   const argb = new Uint32Array(w * h);
-  argb.fill(color);
+  const paint = (x: number, y: number): void => {
+    if (x < 0 || y < 0 || x >= w || y >= h) return;
+    const pattern = normalizedShapePattern(sprite);
+    if (pattern <= 1 || shapePatternOn(pattern, x, y)) {
+      argb[y * w + x] = (0xff000000 | (sprite.foreColor & 0x00ffffff)) >>> 0;
+    } else if (sprite.hasBackColor) {
+      argb[y * w + x] = (0xff000000 | (sprite.backColor & 0x00ffffff)) >>> 0;
+    }
+  };
+  const fill = (): void => {
+    for (let y = 0; y < h; ++y) {
+      for (let x = 0; x < w; ++x) paint(x, y);
+    }
+  };
+  const line = (x0: number, y0: number, x1: number, y1: number): void => {
+    const dx = Math.abs(x1 - x0);
+    const sx = x0 < x1 ? 1 : -1;
+    const dy = -Math.abs(y1 - y0);
+    const sy = y0 < y1 ? 1 : -1;
+    let error = dx + dy;
+    while (true) {
+      paint(x0, y0);
+      if (x0 === x1 && y0 === y1) break;
+      const e2 = 2 * error;
+      if (e2 >= dy) { error += dy; x0 += sx; }
+      if (e2 <= dx) { error += dx; y0 += sy; }
+    }
+  };
+  const rect = (inset: number): void => {
+    const rw = w - inset * 2;
+    const rh = h - inset * 2;
+    if (rw <= 0 || rh <= 0) return;
+    for (let x = inset; x < inset + rw; ++x) {
+      paint(x, inset);
+      paint(x, inset + rh - 1);
+    }
+    for (let y = inset; y < inset + rh; ++y) {
+      paint(inset, y);
+      paint(inset + rw - 1, y);
+    }
+  };
+  const oval = (inset: number, filled: boolean): void => {
+    const cx = Math.floor(w / 2);
+    const cy = Math.floor(h / 2);
+    const rx = Math.max(0, Math.floor(w / 2) - inset);
+    const ry = Math.max(0, Math.floor(h / 2) - inset);
+    if (rx <= 0 || ry <= 0) return;
+    for (let y = 0; y < h; ++y) {
+      for (let x = 0; x < w; ++x) {
+        const nx = (x + 0.5 - cx) / rx;
+        const ny = (y + 0.5 - cy) / ry;
+        const value = nx * nx + ny * ny;
+        if ((filled && value <= 1) || (!filled && value >= 0.75 && value <= 1.15)) paint(x, y);
+      }
+    }
+  };
+
+  const shapeType = sprite.shapeType ?? 0;
+  const filled = sprite.shapeFilled ?? true;
+  if (shapeType === 8) {
+    const strokes = Math.max(1, sprite.shapeLineSize ?? 1);
+    const bottomToTop = sprite.shapeLineDirection === 6;
+    const startY = bottomToTop ? h - 1 : 0;
+    const endY = bottomToTop ? 0 : h - 1;
+    for (let i = 0; i < strokes; ++i) {
+      line(0, Math.max(0, Math.min(h - 1, startY - i)),
+        w - 1, Math.max(0, Math.min(h - 1, endY - i)));
+    }
+  } else if (shapeType === 3) {
+    if (filled) oval(0, true);
+    else {
+      const strokes = Math.max(0, (sprite.shapeLineSize ?? 1) - 1);
+      for (let i = 0; i < strokes; ++i) oval(i, false);
+    }
+  } else if (shapeType === 1 || shapeType === 2) {
+    if (filled) fill();
+    else {
+      const strokes = Math.max(0, (sprite.shapeLineSize ?? 1) - 1);
+      for (let i = 0; i < strokes; ++i) rect(i);
+    }
+  } else {
+    fill();
+  }
   return new Bitmap(w, h, 32, argb);
+}
+
+/** Edge-connected MATTE preprocessing used by LibreShockwave's InkProcessor. */
+function matteBitmap(source: Bitmap, sprite: RenderSprite, useDirectorBackColor = true): Bitmap {
+  const w = source.width();
+  const h = source.height();
+  if (w <= 0 || h <= 0) return source;
+  const pixels = source.pixels();
+  const paletteIndices = source.paletteIndices();
+  let matteIndex: number | null = null;
+  if (paletteIndices && paletteIndices.length === pixels.length) {
+    const counts = new Map<number, number>();
+    const count = (index: number): void => {
+      const value = paletteIndices[index] & 0xff;
+      counts.set(value, (counts.get(value) ?? 0) + 1);
+    };
+    for (let x = 0; x < w; ++x) {
+      count(x);
+      if (h > 1) count((h - 1) * w + x);
+    }
+    for (let y = 1; y + 1 < h; ++y) {
+      count(y * w);
+      if (w > 1) count(y * w + w - 1);
+    }
+    let bestCount = -1;
+    for (const [value, n] of counts) {
+      if (n > bestCount) {
+        matteIndex = value;
+        bestCount = n;
+      }
+    }
+  }
+  let matteRgb: number;
+  if (useDirectorBackColor) {
+    // Explicit MATTE selection is based on the resolved backColor, not merely
+    // the most frequent edge index.
+    matteIndex = null;
+    if (sprite.backColor > 255) {
+      matteRgb = sprite.backColor & 0x00ffffff;
+    } else {
+      const palette = source.imagePalette();
+      if (palette && sprite.backColor >= 0 && sprite.backColor < palette.size()) {
+        matteRgb = palette.getColor(sprite.backColor) & 0x00ffffff;
+      } else {
+        const gray = 255 - sprite.backColor;
+        matteRgb = ((gray & 0xff) << 16) | ((gray & 0xff) << 8) | (gray & 0xff);
+      }
+    }
+  } else {
+    const counts = new Map<number, number>();
+    const count = (index: number): void => {
+      if ((pixels[index] >>> 24) === 0) return;
+      const rgb = pixels[index] & 0x00ffffff;
+      counts.set(rgb, (counts.get(rgb) ?? 0) + 1);
+    };
+    for (let x = 0; x < w; ++x) {
+      count(x);
+      if (h > 1) count((h - 1) * w + x);
+    }
+    for (let y = 1; y + 1 < h; ++y) {
+      count(y * w);
+      if (w > 1) count(y * w + w - 1);
+    }
+    let bestCount = -1;
+    matteRgb = pixels[0] & 0x00ffffff;
+    for (const [rgb, n] of counts) {
+      if (n > bestCount) {
+        matteRgb = rgb;
+        bestCount = n;
+      }
+    }
+  }
+
+  const transparent = new Uint8Array(w * h);
+  const queue = new Int32Array(w * h);
+  let read = 0;
+  let write = 0;
+  const enqueue = (index: number): void => {
+    if (transparent[index]) return;
+    const pixel = pixels[index];
+    const matchesMatte = matteIndex !== null && paletteIndices
+      ? (paletteIndices[index] & 0xff) === matteIndex
+      : (pixel & 0x00ffffff) === matteRgb;
+    if ((pixel >>> 24) !== 0 && !matchesMatte) return;
+    transparent[index] = 1;
+    queue[write++] = index;
+  };
+  for (let x = 0; x < w; ++x) {
+    enqueue(x);
+    enqueue((h - 1) * w + x);
+  }
+  for (let y = 1; y + 1 < h; ++y) {
+    enqueue(y * w);
+    enqueue(y * w + w - 1);
+  }
+  while (read < write) {
+    const index = queue[read++];
+    const x = index % w;
+    const y = Math.floor(index / w);
+    if (x > 0) enqueue(index - 1);
+    if (x + 1 < w) enqueue(index + 1);
+    if (y > 0) enqueue(index - w);
+    if (y + 1 < h) enqueue(index + w);
+  }
+  const result = pixels.slice();
+  for (let i = 0; i < result.length; ++i) {
+    if (transparent[i]) result[i] = 0;
+  }
+  return new Bitmap(w, h, source.bitDepth(), result);
 }
 
 /** Composes a frame's sprites into a stage Bitmap. Mirrors SoftwareFrameRenderer::renderFrame. */
@@ -100,6 +304,20 @@ export function renderFrame(snapshot: FrameSnapshot, stageWidth: number, stageHe
     }
     if (baked === null || baked.width() <= 0 || baked.height() <= 0 || baked.pixels().length === 0) {
       continue;
+    }
+    // Authored indexed MATTE media reaches this compositor as an opaque raster
+    // and still needs edge-keying. Script canvases and already processed matte
+    // bitmaps carry transparency and must not be keyed a second time.
+    if (sprite.ink === InkMode.MATTE) {
+      baked = matteBitmap(baked, sprite);
+    }
+    // LibreShockwave isolates indexed ADD/ADD_PIN media with
+    // applyFloodFillTransparency before compositing. Exported `.rgba` assets no
+    // longer carry their parallel palette-index plane, so recover the equivalent
+    // edge-connected backing from the lossless decoded colors.
+    if ((sprite.ink === InkMode.ADD_PIN || sprite.ink === InkMode.ADD)
+        && !baked.isScriptModified()) {
+      baked = matteBitmap(baked, sprite, false);
     }
 
     const sx = sprite.x;
