@@ -25,7 +25,7 @@ describe("ScorePlayer", () => {
     expect(p.effectiveTempo(0)).toBe(10);
     expect(p.effectiveTempo(1)).toBe(30);
     expect(p.frameDelayMs(0)).toBe(100); // 1000 / 10
-    expect(p.frameDelayMs(1)).toBeCloseTo(1000 / 30, 5);
+    expect(p.frameDelayMs(1)).toBe(33); // floor(1000 / 30), matching the C++ player
   });
 
   it("falls back to DEFAULT_TEMPO when no tempo is carried at all", () => {

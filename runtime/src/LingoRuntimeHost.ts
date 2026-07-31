@@ -14,6 +14,7 @@ import type { ScorePlayer } from "./ScorePlayer.js";
 import {
   LingoNotImplemented,
   LingoList,
+  LingoPoint,
   LingoPropList,
   LingoCastLibProxy,
   LingoMemberProxy,
@@ -160,9 +161,23 @@ interface HostState {
   mouseH: number;
   mouseV: number;
   mouseDown: boolean;
+  rightMouseDown: boolean;
+  clickOn: number;
+  clickLocH: number;
+  clickLocV: number;
+  doubleClick: boolean;
+  rollover: number;
   key: string;
   keyCode: number;
   shiftDown: boolean;
+  controlDown: boolean;
+  altDown: boolean;
+  keyboardFocusSprite: number;
+  selStart: number;
+  selEnd: number;
+  lastClickTime: number;
+  lastClickH: number;
+  lastClickV: number;
 }
 
 interface DynamicMember {
@@ -596,9 +611,23 @@ export class LingoRuntimeHost implements LingoHost {
       mouseH: 0,
       mouseV: 0,
       mouseDown: false,
+      rightMouseDown: false,
+      clickOn: 0,
+      clickLocH: 0,
+      clickLocV: 0,
+      doubleClick: false,
+      rollover: 0,
       key: "",
       keyCode: 0,
       shiftDown: false,
+      controlDown: false,
+      altDown: false,
+      keyboardFocusSprite: 0,
+      selStart: 0,
+      selEnd: 0,
+      lastClickTime: 0,
+      lastClickH: 0,
+      lastClickV: 0,
     };
     // Pre-populate Director built-in globals so handlers can read _player.windowList etc.
     this.state.globals.set("_player", makePlayerObject());
@@ -1197,6 +1226,15 @@ export class LingoRuntimeHost implements LingoHost {
         }
         return m;
       }
+      // A bare member name is not restricted to the current cast library when
+      // that library has no member by that name. Director's resource manager
+      // falls through to the other loaded cast libraries; this matters for
+      // shared UI assets such as button slices referenced by a window class.
+      if (currentLib !== undefined) {
+        for (const m of members) {
+          if (m.name === id) return m;
+        }
+      }
       // Search dynamically-loaded castlibs (the eager loader registers them via
       // `registerCastlib` at startup). Mirror the per-castlib `membersByName` index
       // for every registered castlib, then verify the candidate's castLib matches
@@ -1739,6 +1777,157 @@ export class LingoRuntimeHost implements LingoHost {
     }
   }
 
+  /** Give a text/field sprite keyboard focus, matching InputHandler's editable-field focus. */
+  focusTextSprite(channel: number): void {
+    const sprite = this.snapshot?.sprites.find((candidate) => candidate.channel === channel);
+    if (!sprite) return;
+    const token = this.memberFromSprite(sprite);
+    const textValue = this.getMemberProp(token, "text");
+    if (textValue === undefined) return;
+    const text = String(textValue);
+    this.state.keyboardFocusSprite = channel;
+    this.state.selStart = text.length;
+    this.state.selEnd = text.length;
+  }
+
+  updateDoubleClick(mouseH: number, mouseV: number): void {
+    const now = Date.now();
+    this.state.doubleClick = now - this.state.lastClickTime <= 500
+      && Math.abs(mouseH - this.state.lastClickH) <= 5
+      && Math.abs(mouseV - this.state.lastClickV) <= 5;
+    this.state.lastClickTime = now;
+    this.state.lastClickH = mouseH;
+    this.state.lastClickV = mouseV;
+  }
+
+  /** Apply one browser key to the focused Director text member. Returns true when consumed. */
+  handleTextInput(channel: number, keyCode: number, keyChar: string): boolean {
+    if (this.state.keyboardFocusSprite !== channel) return false;
+    const sprite = this.snapshot?.sprites.find((candidate) => candidate.channel === channel);
+    if (!sprite) return false;
+    const token = this.memberFromSprite(sprite);
+    const current = this.getMemberProp(token, "text");
+    if (current === undefined) return false;
+    const text = String(current);
+    let start = Math.max(0, Math.min(text.length, Math.min(this.state.selStart, this.state.selEnd)));
+    let end = Math.max(0, Math.min(text.length, Math.max(this.state.selStart, this.state.selEnd)));
+    let nextStart = start;
+    let nextEnd = end;
+    let replacement: string | null = null;
+    switch (keyCode) {
+      case 8: // Backspace
+        if (start === end && start > 0) start -= 1;
+        replacement = "";
+        nextStart = start;
+        nextEnd = start;
+        break;
+      case 46: // Delete
+        if (start === end && end < text.length) end += 1;
+        replacement = "";
+        nextStart = start;
+        nextEnd = start;
+        break;
+      case 37: // Left
+        nextStart = nextEnd = start === end ? Math.max(0, start - 1) : start;
+        break;
+      case 39: // Right
+        nextStart = nextEnd = start === end ? Math.min(text.length, end + 1) : end;
+        break;
+      case 36: // Home
+        nextStart = nextEnd = 0;
+        break;
+      case 35: // End
+        nextStart = nextEnd = text.length;
+        break;
+      case 13: // Return
+        replacement = "\r";
+        nextStart = nextEnd = start + 1;
+        break;
+      case 9: // Tab is handled by the stage bridge's focus traversal.
+        return false;
+      default:
+        if (keyChar.length === 0 || this.state.controlDown || this.state.altDown) return false;
+        replacement = keyChar;
+        nextStart = nextEnd = start + keyChar.length;
+        break;
+    }
+    if (replacement === null) {
+      this.state.selStart = nextStart;
+      this.state.selEnd = nextEnd;
+      return true;
+    }
+    const updated = text.slice(0, start) + replacement + text.slice(end);
+    this.setMemberProp(token, "text", updated);
+    this.refreshTextSprite(sprite, token);
+    this.state.selStart = Math.min(updated.length, nextStart);
+    this.state.selEnd = Math.min(updated.length, nextEnd);
+    return true;
+  }
+
+  selectFocusedText(): void {
+    const channel = this.state.keyboardFocusSprite;
+    const sprite = this.snapshot?.sprites.find((candidate) => candidate.channel === channel);
+    if (!sprite) return;
+    const text = this.getMemberProp(this.memberFromSprite(sprite), "text");
+    if (text !== undefined) {
+      this.state.selStart = 0;
+      this.state.selEnd = String(text).length;
+    }
+  }
+
+  getSelectedText(): string {
+    const channel = this.state.keyboardFocusSprite;
+    const sprite = this.snapshot?.sprites.find((candidate) => candidate.channel === channel);
+    if (!sprite) return "";
+    const text = String(this.getMemberProp(this.memberFromSprite(sprite), "text") ?? "");
+    const start = Math.max(0, Math.min(text.length, Math.min(this.state.selStart, this.state.selEnd)));
+    const end = Math.max(0, Math.min(text.length, Math.max(this.state.selStart, this.state.selEnd)));
+    return text.slice(start, end);
+  }
+
+  cutFocusedText(): string {
+    const selected = this.getSelectedText();
+    if (!selected) return selected;
+    const channel = this.state.keyboardFocusSprite;
+    const sprite = this.snapshot?.sprites.find((candidate) => candidate.channel === channel);
+    if (!sprite) return selected;
+    const token = this.memberFromSprite(sprite);
+    const text = String(this.getMemberProp(token, "text") ?? "");
+    const start = Math.max(0, Math.min(text.length, Math.min(this.state.selStart, this.state.selEnd)));
+    const updated = text.slice(0, start) + text.slice(start + selected.length);
+    this.setMemberProp(token, "text", updated);
+    this.refreshTextSprite(sprite, token);
+    this.state.selStart = start;
+    this.state.selEnd = start;
+    return selected;
+  }
+
+  pasteFocusedText(value: string): void {
+    if (this.state.keyboardFocusSprite <= 0) return;
+    this.handleTextInput(this.state.keyboardFocusSprite, 0, value);
+  }
+
+  private refreshTextSprite(sprite: RenderSprite, token: MemberToken): void {
+    if (typeof token.id === "number" && this.isDynamicMemberId(token.id)) {
+      const dyn = this.dynamicMembers.get(token.id);
+      if (!dyn || (dyn.type !== "text" && dyn.type !== "field")) return;
+      const image = this.renderTextMemberImage(dyn, Math.max(1, sprite.width), Math.max(1, sprite.height));
+      sprite.bakedBitmap = image.bitmap;
+      return;
+    }
+    const resolved = this.resolveMember(token.id, token.castLib);
+    const type = resolved?.type?.toLowerCase() ?? "";
+    if (!resolved || (type !== "text" && type !== "field")) return;
+    const key = this.memberCacheKey(resolved, token);
+    const props = new Map(this.memberRuntimeProps.get(key) ?? []);
+    const tempId = -sprite.channel;
+    this.memberRuntimeProps.set(`dynamic:${tempId}`, props);
+    const temp: DynamicMember = { id: tempId, castLib: resolved.castLib, type, name: resolved.name, text: String(this.getMemberProp(token, "text") ?? "") };
+    const image = this.renderTextMemberImage(temp, Math.max(1, sprite.width), Math.max(1, sprite.height));
+    sprite.bakedBitmap = image.bitmap;
+    this.memberRuntimeProps.delete(`dynamic:${tempId}`);
+  }
+
   /** Mirror common Director text-member property aliases so that layout files
    * authored with `#txtColor` / `#txtBGColor` are readable as `.color` and
    * `.bgColor` (and vice-versa). */
@@ -1879,7 +2068,12 @@ export class LingoRuntimeHost implements LingoHost {
     // Director applies topSpacing before the first baseline as well as between
     // subsequent lines. Writer call sites intentionally offset the returned
     // image by this authored leading.
-    let y = topSpacing;
+    // LibreShockwave's normal Volter face places its first glyph row one pixel
+    // above the browser canvas top-spacing origin. Bold `vb` text already
+    // matches the Director raster position, so keep this correction limited to
+    // the authored normal `v`/`V` family.
+    const normalVolterOffset = rawFont === "v" || rawFont === "V" ? -1 : 0;
+    let y = topSpacing + normalVolterOffset;
     for (const line of lines) {
       let x = 0;
       if (textAlign === "center") x = canvas.width / 2;
@@ -1973,8 +2167,36 @@ export class LingoRuntimeHost implements LingoHost {
         return this.state.mouseV;
       case "mousedown":
         return this.state.mouseDown ? 1 : 0;
+      case "mouseup":
+        return this.state.mouseDown ? 0 : 1;
+      case "rightmousedown":
+        return this.state.rightMouseDown ? 1 : 0;
+      case "clickon":
+        return this.state.clickOn;
+      case "clickloc":
+        return new LingoList([this.state.clickLocH, this.state.clickLocV]);
+      case "mouseloc":
+        return new LingoList([this.state.mouseH, this.state.mouseV]);
+      case "doubleclick":
+        return this.state.doubleClick ? 1 : 0;
+      case "rollover":
+        return this.state.rollover;
       case "shiftdown":
         return this.state.shiftDown;
+      case "optiondown":
+      case "altdown":
+        return this.state.altDown;
+      case "commanddown":
+      case "controldown":
+        return this.state.controlDown;
+      case "keypressed":
+        return this.state.keyCode;
+      case "keyboardfocussprite":
+        return this.state.keyboardFocusSprite;
+      case "selstart":
+        return this.state.selStart;
+      case "selend":
+        return this.state.selEnd;
       case "randomseed":
         return this.state.randomSeed;
       case "tracescript":
@@ -2114,6 +2336,27 @@ export class LingoRuntimeHost implements LingoHost {
       case "mousedown":
         this.state.mouseDown = Boolean(value);
         return;
+      case "mouseup":
+        this.state.mouseDown = !Boolean(value);
+        return;
+      case "rightmousedown":
+        this.state.rightMouseDown = Boolean(value);
+        return;
+      case "clickon":
+        this.state.clickOn = Number(value) || 0;
+        return;
+      case "doubleclick":
+        this.state.doubleClick = Boolean(value);
+        return;
+      case "clickloc": {
+        const point = value instanceof LingoList ? value.toArray() : Array.isArray(value) ? value : [];
+        this.state.clickLocH = Number(point[0]) || 0;
+        this.state.clickLocV = Number(point[1]) || 0;
+        return;
+      }
+      case "rollover":
+        this.state.rollover = Number(value) || 0;
+        return;
       case "key":
         this.state.key = String(value);
         return;
@@ -2122,6 +2365,27 @@ export class LingoRuntimeHost implements LingoHost {
         return;
       case "shiftdown":
         this.state.shiftDown = Boolean(value);
+        return;
+      case "optiondown":
+      case "altdown":
+        this.state.altDown = Boolean(value);
+        return;
+      case "commanddown":
+      case "controldown":
+        this.state.controlDown = Boolean(value);
+        return;
+      case "keyboardfocussprite":
+        this.state.keyboardFocusSprite = Number(value) || 0;
+        if (this.state.keyboardFocusSprite <= 0) {
+          this.state.selStart = 0;
+          this.state.selEnd = 0;
+        }
+        return;
+      case "selstart":
+        this.state.selStart = Math.max(0, Number(value) || 0);
+        return;
+      case "selend":
+        this.state.selEnd = Math.max(0, Number(value) || 0);
         return;
       case "randomseed":
         this.setRandomSeed(Number(value) | 0);
@@ -2226,7 +2490,7 @@ export class LingoRuntimeHost implements LingoHost {
       case "random":
         return this.randomInt(Number(args[0]) || 1);
       case "point":
-        return [Number(args[0] ?? 0), Number(args[1] ?? 0)];
+        return new LingoPoint([Number(args[0] ?? 0), Number(args[1] ?? 0)]);
       case "go":
         this.go(args[0]);
         return undefined;
@@ -2314,18 +2578,22 @@ export class LingoRuntimeHost implements LingoHost {
           }
         };
         if (target instanceof LingoList) {
-          return new LingoList(target.toArray().map(invoke));
+          let lastResult: LingoValue = LINGO_VOID;
+          for (const value of target.toArray()) lastResult = invoke(value);
+          return lastResult;
         }
         if (target instanceof LingoPropList) {
-          const results: LingoValue[] = [];
+          let lastResult: LingoValue = LINGO_VOID;
           for (let i = 1; i <= target.count; i++) {
             const value = target.get(target.getPropAt(i));
-            if (value !== undefined) results.push(invoke(value));
+            if (value !== undefined) lastResult = invoke(value);
           }
-          return new LingoList(results);
+          return lastResult;
         }
         if (Array.isArray(target)) {
-          return new LingoList((target as LingoValue[]).map(invoke));
+          let lastResult: LingoValue = LINGO_VOID;
+          for (const value of target as LingoValue[]) lastResult = invoke(value);
+          return lastResult;
         }
         return invoke(target);
       }
@@ -2511,7 +2779,15 @@ export class LingoRuntimeHost implements LingoHost {
           if (this.instanceDispatcher && me && typeof me === "object") {
             const scriptName = (me as { props?: Map<string, LingoValue> }).props?.get("__scriptName");
             if (typeof scriptName === "string") {
-              return this.instanceDispatcher(scriptName, methodName, me as LingoMe, methodArgs);
+              const result = this.instanceDispatcher(scriptName, methodName, me as LingoMe, methodArgs);
+              // Resource Manager Class keeps a runtime name index. If that
+              // index predates a lazily loaded cast, resolve the name through
+              // the host's authoritative cast registry before returning 0.
+              if (methodName.toLowerCase() === "getmemnum" && (!result || Number(result) < 1)) {
+                const resolved = this.resolveMember(String(methodArgs[0] ?? ""), undefined);
+                if (resolved) return (resolved.castLib << 16) | (resolved.id & 0xFFFF);
+              }
+              return result;
             }
           }
           if (me && typeof me === "object") {

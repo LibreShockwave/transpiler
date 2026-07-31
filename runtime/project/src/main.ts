@@ -443,6 +443,47 @@ void (async () => {
       if (module) dispatchModuleEvent(module, event, me);
     }
   };
+  const dispatchWindowInput = (event: string, mouseH: number, mouseV: number): boolean => {
+    const handlerName = event === "mouseUpOutside" ? "mouseUpOutSide" : event;
+    let selected: {
+      me: runtime.LingoMe;
+      module: ScriptModule;
+      id: string;
+      z: number;
+      left: number;
+      top: number;
+    } | undefined;
+    for (const me of parentInstances) {
+      const module = resolveLayerModule(me);
+      if (!module || !module.lsHandlers.some((handler) => handler.name === handlerName)) continue;
+      const sprites = me.props.get("pSpriteList");
+      if (!(sprites instanceof runtime.LingoPropList)) continue;
+      for (let i = 1; i <= sprites.count; i += 1) {
+        const key = sprites.keyAt(i);
+        const id = runtime.isSymbol(key) ? key.name : runtime.lingoString(key);
+        const sprite = sprites.get(key) as runtime.LingoSpriteProxy;
+        if (!sprite || !sprite.visible) continue;
+        if (mouseH < sprite.left || mouseH >= sprite.right || mouseV < sprite.top || mouseV >= sprite.bottom) {
+          continue;
+        }
+        if (!selected || sprite.locZ >= selected.z) {
+          selected = { me, module, id, z: sprite.locZ, left: sprite.left, top: sprite.top };
+        }
+      }
+    }
+    if (!selected) {
+      return false;
+    }
+    // Window event procedures receive the pointer relative to the selected
+    // window element, not just the element id.  Director's navigator handlers
+    // use this point to convert a room-list click into a row index.
+    invokeInstance(selected.module, handlerName, selected.me, [
+      0,
+      selected.id,
+      new runtime.LingoPoint([mouseH - selected.left, mouseV - selected.top]),
+    ]);
+    return true;
+  };
 
   // Bare Lingo calls resolve to MovieScript/global handlers, not same-named Parent
   // methods. Parent handlers are dispatched only through their script instances.
@@ -501,6 +542,19 @@ void (async () => {
     }
     dispatchMovieScripts(event);
     dispatchParentInstances(event);
+  };
+  const dispatchFrameAndMovie = (event: string): void => {
+    const frame = score.frames[frameIndex];
+    if (frame?.frameScript) {
+      const module = moduleForBehavior(frame.frameScript);
+      if (module) {
+        const me = host.createMe(0);
+        me.props.set("__scriptName", module.lsScriptName);
+        runtime.seedScriptProps(me, module.lsLingoSource);
+        dispatchModuleEvent(module, event, me);
+      }
+    }
+    dispatchMovieScripts(event);
   };
   const updateBehaviorActivation = (): void => {
     const next = new Map<string, ScoreBehaviorJson>();
@@ -581,7 +635,10 @@ void (async () => {
   renderCurrentFrame();
 
   let paused = params.has("__lsPaused");
-  let previousTick = performance.now();
+  // Keep an accumulated deadline like LibreShockwave's browser worker. Resetting
+  // the deadline to `now` after a slow render silently drops overdue movie ticks,
+  // slowing authored updates (clouds/cars) below the score tempo.
+  let nextTickAt = performance.now() + player.frameDelayMs(frameIndex);
   const stepFrame = (): void => {
     dispatchFrame("stepFrame");
     dispatchFrame("prepareFrame");
@@ -597,8 +654,10 @@ void (async () => {
   };
   const tick = (now: number): void => {
     requestAnimationFrame(tick);
-    if (paused || now - previousTick < player.frameDelayMs(frameIndex)) return;
-    previousTick = now;
+    if (paused || now < nextTickAt) return;
+    const delay = player.frameDelayMs(frameIndex);
+    nextTickAt += delay;
+    if (nextTickAt < now - delay) nextTickAt = now;
     stepFrame();
   };
   requestAnimationFrame(tick);
@@ -612,34 +671,140 @@ void (async () => {
   };
   const updatePointer = (event: PointerEvent): void => {
     const rect = app.canvas.getBoundingClientRect();
-    host.setThe("mouseH", Math.floor((event.clientX - rect.left) * score.stageWidth / rect.width));
-    host.setThe("mouseV", Math.floor((event.clientY - rect.top) * score.stageHeight / rect.height));
+    const x = Math.max(0, Math.min(score.stageWidth - 1,
+      Math.floor((event.clientX - rect.left) * score.stageWidth / Math.max(1, rect.width))));
+    const y = Math.max(0, Math.min(score.stageHeight - 1,
+      Math.floor((event.clientY - rect.top) * score.stageHeight / Math.max(1, rect.height))));
+    host.setThe("mouseH", x);
+    host.setThe("mouseV", y);
+  };
+  const hitSpriteAt = (): number => {
+    if (!currentSnapshot) return 0;
+    const candidates = [...currentSnapshot.sprites]
+      .filter((sprite) => sprite.visible && sprite.hasBehaviors && sprite.width > 0 && sprite.height > 0)
+      .sort((a, b) => (b.locZ - a.locZ) || (b.channel - a.channel));
+    const mouseH = Number(host.getThe("mouseH"));
+    const mouseV = Number(host.getThe("mouseV"));
+    return candidates.find((sprite) => mouseH >= sprite.x && mouseH < sprite.x + sprite.width
+      && mouseV >= sprite.y && mouseV < sprite.y + sprite.height)?.channel ?? 0;
+  };
+  const dispatchSpriteInput = (channel: number, event: string): void => {
+    const behavior = score.frames[frameIndex]?.behaviors?.find((candidate) => candidate.channel === channel);
+    if (behavior) dispatchBehavior(behavior, event);
+  };
+  const updateRollover = (): void => {
+    const previous = Number(host.getThe("rollover"));
+    const current = hitSpriteAt();
+    if (previous !== current) {
+      if (previous > 0) dispatchSpriteInput(previous, "mouseLeave");
+      if (current > 0) dispatchSpriteInput(current, "mouseEnter");
+      host.setThe("rollover", current);
+    }
+    dispatchWindowInput("mouseWithin", Number(host.getThe("mouseH")), Number(host.getThe("mouseV")));
+    if (current > 0) dispatchSpriteInput(current, "mouseWithin");
+  };
+  const dispatchMouse = (event: string, channel: number): void => {
+    dispatchWindowInput(event, Number(host.getThe("mouseH")), Number(host.getThe("mouseV")));
+    if (channel > 0) dispatchSpriteInput(channel, event);
+    dispatchFrameAndMovie(event);
+  };
+  const directorKeyCode = (event: KeyboardEvent): number => {
+    const code = event.keyCode || event.which;
+    const special: Record<number, number> = {
+      8: 51, 9: 48, 13: 36, 27: 53, 32: 49, 33: 116, 34: 121,
+      35: 119, 36: 115, 37: 123, 38: 126, 39: 124, 40: 125,
+      46: 117, 112: 122, 113: 120, 114: 99, 115: 118, 116: 96,
+      117: 97, 118: 98, 119: 100, 120: 101, 121: 109, 122: 103, 123: 111,
+    };
+    if (special[code] !== undefined) return special[code];
+    if (code >= 65 && code <= 90) {
+      const macLetters = [0, 11, 8, 2, 14, 3, 5, 4, 34, 38, 40, 37, 46,
+        45, 31, 35, 12, 15, 1, 17, 32, 9, 13, 7, 16, 6];
+      return macLetters[code - 65] ?? code;
+    }
+    if (code >= 48 && code <= 57) {
+      const macDigits = [29, 18, 19, 20, 21, 23, 22, 26, 28, 25];
+      return macDigits[code - 48] ?? code;
+    }
+    return code;
   };
   app.canvas.addEventListener("pointermove", updatePointer);
+  app.canvas.addEventListener("pointermove", () => updateRollover());
   app.canvas.addEventListener("pointerdown", (event) => {
+    app.canvas.focus();
     updatePointer(event);
-    host.setThe("mouseDown", true);
+    updateRollover();
+    const channel = hitSpriteAt();
+    if (event.button === 2) {
+      host.setThe("rightMouseDown", true);
+      dispatchMouse("rightMouseDown", channel);
+    } else {
+      host.setThe("mouseDown", true);
+      host.setThe("clickOn", channel);
+      host.setThe("clickLoc", new runtime.LingoList([
+        host.getThe("mouseH"), host.getThe("mouseV"),
+      ]));
+      host.updateDoubleClick(Number(host.getThe("mouseH")), Number(host.getThe("mouseV")));
+      if (channel > 0) host.focusTextSprite(channel);
+      dispatchMouse("mouseDown", channel);
+    }
     void primeAudio();
-    dispatchFrame("mouseDown");
+    event.preventDefault();
   });
-  app.canvas.addEventListener("pointerup", (event) => {
+  const releasePointer = (event: PointerEvent): void => {
     updatePointer(event);
-    host.setThe("mouseDown", false);
-    dispatchFrame("mouseUp");
-  });
-  document.addEventListener("keydown", (event) => {
+    const channel = Number(host.getThe("clickOn"));
+    if (event.button === 2 || Boolean(host.getThe("rightMouseDown"))) {
+      host.setThe("rightMouseDown", false);
+      dispatchMouse("rightMouseUp", channel);
+    } else {
+      host.setThe("mouseDown", false);
+      const release = hitSpriteAt();
+      dispatchMouse(channel > 0 && release !== channel ? "mouseUpOutside" : "mouseUp", channel || release);
+      host.setThe("clickOn", 0);
+    }
+  };
+  document.addEventListener("pointerup", releasePointer);
+  app.canvas.addEventListener("contextmenu", (event) => event.preventDefault());
+  app.canvas.addEventListener("keydown", (event) => {
+    const code = directorKeyCode(event);
     host.setThe("key", event.key);
-    host.setThe("keyCode", event.keyCode);
+    host.setThe("keyCode", code);
     host.setThe("shiftDown", event.shiftKey);
+    host.setThe("controlDown", event.ctrlKey || event.metaKey);
+    host.setThe("altDown", event.altKey);
     void primeAudio();
-    dispatchFrame("keyDown");
+    const focus = Number(host.getThe("keyboardFocusSprite"));
+    if (event.key.toLowerCase() === "a" && (event.ctrlKey || event.metaKey)) {
+      host.selectFocusedText();
+      event.preventDefault();
+      return;
+    }
+    if (focus > 0 && host.handleTextInput(focus, event.keyCode || event.which, event.key)) {
+      event.preventDefault();
+    }
+    dispatchMouse("keyDown", focus);
   });
-  document.addEventListener("keyup", (event) => {
+  app.canvas.addEventListener("keyup", (event) => {
+    const code = directorKeyCode(event);
     host.setThe("key", event.key);
-    host.setThe("keyCode", event.keyCode);
+    host.setThe("keyCode", code);
     host.setThe("shiftDown", event.shiftKey);
-    dispatchFrame("keyUp");
+    host.setThe("controlDown", event.ctrlKey || event.metaKey);
+    host.setThe("altDown", event.altKey);
+    const focus = Number(host.getThe("keyboardFocusSprite"));
+    dispatchMouse("keyUp", focus);
   });
+  app.canvas.addEventListener("paste", (event) => {
+    const text = event.clipboardData?.getData("text/plain") ?? "";
+    if (!text) return;
+    const focus = Number(host.getThe("keyboardFocusSprite"));
+    if (focus > 0) {
+      host.handleTextInput(focus, 0, text);
+      event.preventDefault();
+    }
+  });
+  app.canvas.tabIndex = 0;
 
   const harness = window as unknown as {
     __lsReady?: boolean;

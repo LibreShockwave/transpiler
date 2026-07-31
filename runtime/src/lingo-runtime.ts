@@ -380,6 +380,14 @@ export class LingoRect extends LingoList {
   }
 }
 
+/** Director point datum. Points retain list-like 1-based access while reporting #point from ilk. */
+export class LingoPoint extends LingoList {
+  override duplicate(): LingoPoint {
+    const values = this.toArray();
+    return new LingoPoint(values);
+  }
+}
+
 // A propList is an ordered list of [:symbol: value] pairs (Director's [:a:1, :b:2]). Duplicate
 // keys update in place; missing keys read as VOID. Insertion order is preserved for `count` and
 // iteration, matching Director's propList semantics.
@@ -2340,6 +2348,7 @@ export class LingoImage {
   copyPixels(source: LingoValue, destinationRect: LingoValue, sourceRect: LingoValue, options?: LingoValue): void {
     if (!(source instanceof LingoImage)) return;
     const dst = imageDestRectValues(destinationRect);
+    const dstQuad = imageDestQuadValues(destinationRect);
     const src = imageRectValues(sourceRect);
     if (!dst || !src) return;
     const dstWidth = Math.max(0, integer(dst[2]) - integer(dst[0]));
@@ -2418,11 +2427,13 @@ export class LingoImage {
     const dstNeedsIndex = this.depth <= 8;
     for (let dy = 0; dy < dstHeight; dy += 1) {
       const ty = integer(dst[1]) + dy;
-      const sy = integer(src[1]) + Math.floor(dy * srcHeight / dstHeight);
+      const sourceDy = dstQuad?.flipV ? dstHeight - 1 - dy : dy;
+      const sy = integer(src[1]) + Math.floor(sourceDy * srcHeight / dstHeight);
       if (ty < 0 || ty >= this.height || sy < 0 || sy >= source.height) continue;
       for (let dx = 0; dx < dstWidth; dx += 1) {
         const tx = integer(dst[0]) + dx;
-        const sx = integer(src[0]) + Math.floor(dx * srcWidth / dstWidth);
+        const sourceDx = dstQuad?.flipH ? dstWidth - 1 - dx : dx;
+        const sx = integer(src[0]) + Math.floor(sourceDx * srcWidth / dstWidth);
         if (tx < 0 || tx >= this.width || sx < 0 || sx >= source.width) continue;
         const srcOffset = sy * source.width + sx;
         let srcPixel = from[srcOffset];
@@ -2720,6 +2731,20 @@ function imageDestRectValues(value: LingoValue): LingoValue[] | undefined {
   return undefined;
 }
 
+/** Return orientation for Director's axis-aligned destination quads. */
+function imageDestQuadValues(value: LingoValue): { flipH: boolean; flipV: boolean } | undefined {
+  const arr = value instanceof LingoList ? value.toArray() : Array.isArray(value) ? value : undefined;
+  if (!arr || arr.length !== 4 || arr.every((v) => !(v instanceof LingoList) && !Array.isArray(v))) return undefined;
+  const points = arr.map((pt) => pt instanceof LingoList ? pt.toArray() : Array.isArray(pt) ? pt : []);
+  if (points.some((pt) => pt.length < 2)) return undefined;
+  const x0 = float(points[0][0]);
+  const y0 = float(points[0][1]);
+  const x1 = float(points[1][0]);
+  const y3 = float(points[3][1]);
+  if (![x0, y0, x1, y3].every(Number.isFinite)) return undefined;
+  return { flipH: x0 > x1, flipV: y0 > y3 };
+}
+
 /** Parse a Lingo color value: hex string, rgb object, ColorRef, or numeric RGB. */
 export function parseColor(value: LingoValue, palette?: Palette | null): number {
   if (value instanceof ColorRef) {
@@ -2794,6 +2819,8 @@ export function ilk(value: LingoValue, expectedType?: LingoValue): LingoSymbol |
       (typeof value === "object" && value !== null &&
        "red" in value && "green" in value && "blue" in value)) {
     typeName = "color";
+  } else if (value instanceof LingoPoint) {
+    typeName = "point";
   } else if (value instanceof LingoRect) {
     typeName = "rect";
   } else if (value instanceof LingoList || Array.isArray(value)) {
@@ -2828,31 +2855,29 @@ export function ilk(value: LingoValue, expectedType?: LingoValue): LingoSymbol |
 export function call(handler: LingoValue, target: LingoValue, ...args: LingoValue[]): LingoValue {
   const name = isSymbol(handler) ? handler.name : typeof handler === "string" ? handler : "";
   if (target instanceof LingoList) {
-    const results: LingoValue[] = [];
+    let lastResult: LingoValue = LINGO_VOID;
     for (let i = 1; i <= target.count; i++) {
-      const item = target.get(i);
-      results.push(callMethod(name, item, ...args));
+      lastResult = callMethod(name, target.get(i), ...args);
     }
-    return new LingoList(results);
+    return lastResult;
   }
   if (target instanceof LingoPropList) {
     // Director treats a propList the same as a list for `call` — iterate the values
     // and dispatch the handler to each. This is how the Download Manager calls
     // `call(#update, pActiveTasks)` where pActiveTasks is a propList of task names.
-    const results: LingoValue[] = [];
+    let lastResult: LingoValue = LINGO_VOID;
     for (let i = 1; i <= target.count; i++) {
       const value = target.get(target.getPropAt(i));
-      if (value === undefined) continue;
-      results.push(callMethod(name, value, ...args));
+      if (value !== undefined) lastResult = callMethod(name, value, ...args);
     }
-    return new LingoList(results);
+    return lastResult;
   }
   if (Array.isArray(target)) {
-    const results: LingoValue[] = [];
+    let lastResult: LingoValue = LINGO_VOID;
     for (const item of target) {
-      results.push(callMethod(name, item, ...args));
+      lastResult = callMethod(name, item, ...args);
     }
-    return new LingoList(results);
+    return lastResult;
   }
   return callMethod(name, target, ...args);
 }
@@ -3107,7 +3132,7 @@ export function dispatchValueBuiltin(
       return { handled: true, value: convertToPropList(args[0], args[1] ?? "\r") };
     case "getfirst": return { handled: true, value: getFirst(args[0]) };
     case "getlast": return { handled: true, value: getLast(args[0]) };
-    case "point": return { handled: true, value: new LingoList([float(args[0]), float(args[1])]) };
+    case "point": return { handled: true, value: new LingoPoint([float(args[0]), float(args[1])]) };
     case "rect": return { handled: true, value: rect(args[0], args[1], args[2], args[3]) };
     case "union": {
       const a = valueVector(args[0]) ?? [];

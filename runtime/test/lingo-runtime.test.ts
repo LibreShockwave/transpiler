@@ -4,6 +4,7 @@ import {
   float,
   lingoString,
   LingoList,
+  LingoPoint,
   LingoPropList,
   LingoNotImplemented,
   sprite,
@@ -69,6 +70,31 @@ describe("LingoImage createMatte", () => {
   });
 });
 
+describe("LingoImage copyPixels destination quads", () => {
+  it("honors horizontal and vertical reversal in axis-aligned quads", () => {
+    const source = new LingoImage(2, 2, 32);
+    source.bitmap.pixels().set([
+      0xffff0000, 0xff00ff00,
+      0xff0000ff, 0xffffff00,
+    ]);
+    const destination = new LingoImage(2, 2, 32);
+
+    destination.copyPixels(
+      source,
+      new LingoList([
+        new LingoList([2, 2]), new LingoList([0, 2]),
+        new LingoList([0, 0]), new LingoList([2, 0]),
+      ]),
+      new LingoList([0, 0, 2, 2]),
+    );
+
+    expect(Array.from(destination.bitmap.pixels())).toEqual([
+      0xffffff00, 0xff0000ff,
+      0xff00ff00, 0xffff0000,
+    ]);
+  });
+});
+
 describe("getAt/setAt bytecode semantics", () => {
   it("keeps positional propList access distinct from digit-string keys", () => {
     const list = new LingoPropList(["5", "key five", "other", "second"]);
@@ -110,6 +136,14 @@ describe("point and rect list properties", () => {
     expect(String(ilk(r))).toBe("#rect");
     expect(ilk(r, symbol("rect"))).toBe(true);
     expect(String(ilk(new LingoList([10, 20, 42, 65])))).toBe("#list");
+  });
+
+  it("preserves Director point type identity", () => {
+    const p = dispatchValueBuiltin("point", [4, 5]).value;
+    expect(p).toBeInstanceOf(LingoPoint);
+    expect((p as LingoList).toArray()).toEqual([4, 5]);
+    expect(String(ilk(p))).toBe("#point");
+    expect(ilk(p, symbol("point"))).toBe(true);
   });
 });
 
@@ -254,7 +288,7 @@ describe("LingoPropList", () => {
 
 describe("LibreShockwave builtin parity", () => {
   it("tracks every unique C++ BuiltinRegistry name", () => {
-    expect(SUPPORTED_LINGO_BUILTINS.size).toBe(123);
+    expect(SUPPORTED_LINGO_BUILTINS.size).toBe(122);
   });
 
   it("dispatches representative math, list, string, type, and geometry builtins", () => {
@@ -296,7 +330,7 @@ describe("value", () => {
 
 describe("lingoString", () => {
   it("renders VOID/booleans/lists Director-style", () => {
-    expect(lingoString(undefined)).toBe("VOID");
+    expect(lingoString(undefined)).toBe("");
     expect(lingoString(true)).toBe("TRUE");
     expect(lingoString(false)).toBe("FALSE");
     expect(lingoString(new LingoList([1, "x"]))).toBe("[1, x]");

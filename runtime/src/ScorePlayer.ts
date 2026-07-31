@@ -52,10 +52,11 @@ export class ScorePlayer {
     return this.baseTempo;
   }
 
-  /** Milliseconds to dwell on the frame at `frameIndex` at its effective tempo. */
+  /** Milliseconds to dwell on the frame at `frameIndex` at its effective tempo.
+   * LibreShockwave's player uses integer millisecond frame durations. */
   frameDelayMs(frameIndex: number): number {
     const fps = this.effectiveTempo(frameIndex);
-    return 1000 / fps;
+    return Math.max(1, Math.floor(1000 / fps));
   }
 
   /** Frame labels / markers within the exported slice, sorted by frame. */
